@@ -230,6 +230,7 @@ pub fn areas() -> Vec<(HWND, windows::Win32::Foundation::RECT, Lands)> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lands {
     Station,
+    Simo(crate::settings::Edge),
     Apps,
     Pages(crate::ui::view::Tab),
     Device(u64),
@@ -247,6 +248,12 @@ pub const SHOW_PAGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 20;
 /// told it by message): a drag over a strip along `edge` opens the station there, as a push into the edge does; one
 /// over where a page is chosen in `window` shows that page there.
 pub fn caught(dragged: Dragged, edge: Option<crate::settings::Edge>, lands: Lands, window: Option<HWND>) {
+    if let Lands::Simo(edge) = lands {
+        if let Dragged::Over(at) = dragged {
+            crate::app().controller.pushed(edge, (at.x, at.y));
+        }
+        return;
+    }
     if lands == Lands::Send {
         if let Some(window) = window {
             crate::ui::settings_window::dragged_in(window, dragged);
@@ -325,6 +332,18 @@ pub fn caught(dragged: Dragged, edge: Option<crate::settings::Edge>, lands: Land
                 let _ = unsafe { PostMessageW(Some(window), SHOW_PAGE, WPARAM(crate::ui::view::Tab::default().number()), LPARAM(1)) };
             }
         }
+    }
+}
+
+/// A file dropped on a SIMO edge (the catcher supplies the most recent screen point).
+pub fn caught_simo(point: windows::Win32::Foundation::POINT, edge: crate::settings::Edge, dragged: Dragged) {
+    let Dragged::Dropped(given) = dragged else { return };
+    let paths = given.into_iter().flat_map(|content| match content {
+        Content::Files(paths) => paths,
+        _ => Vec::new(),
+    }).collect::<Vec<_>>();
+    if !paths.is_empty() {
+        crate::app().controller.simo_dropped(point, edge, paths);
     }
 }
 

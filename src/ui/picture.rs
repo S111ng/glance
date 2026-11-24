@@ -52,6 +52,14 @@ pub fn from_jpeg(jpeg: &[u8], small: (u32, u32)) -> Option<Picture> {
     }
 }
 
+/// Any WIC-readable image bytes, with a small likeness for an attachment preview.
+pub fn from_bytes(bytes: &[u8], small: (u32, u32)) -> Option<Picture> {
+    unsafe {
+        let (factory, image) = decoded(bytes)?;
+        made(&factory, &image, small).ok()
+    }
+}
+
 /// The JPEG `jpeg` made again no larger than `side` either way (its shape kept): a copy small enough to keep.
 pub fn shrunk(jpeg: &[u8], side: u32) -> Option<Vec<u8>> {
     unsafe {

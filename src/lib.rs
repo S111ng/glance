@@ -154,6 +154,8 @@ mod wsl;
 mod docker;
 #[cfg(windows)]
 mod latency;
+#[cfg(windows)]
+mod simo;
 
 
 #[cfg(windows)]

@@ -66,6 +66,10 @@ fn form_of(only: Option<&str>, form: String) -> String {
 }
 
 /// A kept form read back (see `form_of`): the one lane it shows, if it shows one, and its form.
+fn standalone_simo(widget: &WidgetAt) -> bool {
+    widget.parts.is_none() && widget.layout.form == "simo"
+}
+
 fn only_of(kept: &str) -> (Option<String>, String) {
     // (A module's id may hold ':', as a note stuck on the desktop's does; '|' none, nor a file's name.)
     match kept.strip_prefix(ONLY_FORM).and_then(|rest| rest.split_once('|')) {
@@ -728,6 +732,7 @@ impl crate::ui::life::Lives for Widget {
             surface.release(&self.gfx);
         }
         self.content.release();
+        self.simo_ground.release();
         self.hide_hint();
         self.behind = None;
         self.pending = None;
@@ -740,6 +745,7 @@ impl crate::ui::life::Lives for Widget {
     fn let_go_of_kept(&mut self) {
         self.backdrop = None;
         self.surface = None;
+        self.simo_ground.release();
     }
 }
 
@@ -760,12 +766,14 @@ struct Widget {
     /// Counted as shown on its device while it is (see `life`).
     showing: Option<crate::ui::life::Showing>,
     surface: Option<Surface>,
+    simo_ground: render::GroundLayers,
     /// What it shows.
     content: Content,
     /// The screen it is on.
     contact: Contact,
     /// Its surface's corner on the screen (physical px).
     at: POINT,
+    simo_return_at: Option<POINT>,
     /// Shown as where a widget in hand would be merged (beside it, else below), while it would.
     drop_target: Option<bool>,
     /// Merged, pressed on a part after the first: that part (torn out as it is moved), and where it was taken from
@@ -1026,6 +1034,8 @@ enum Content {
     Readings(Readings),
     /// What plays (see `music`).
     Music(MusicShown),
+    /// The SIMO chat, kept as its own desktop widget when torn off the panel.
+    Simo(crate::simo::Chat),
     /// Widgets merged into one (see `Merged`).
     Merged(Box<Merged>),
 }
@@ -1331,6 +1341,9 @@ fn draw_merged(frame: &gfx::Frame, merged: &mut Merged, scene: &Scene, local: Ma
                     frame.fill(theme.rule, theme.pad_x, rule_y, size.0 - 2.0 * theme.pad_x, 1.0);
                 }
             }
+            Content::Simo(chat) => {
+                crate::ui::simo::paint_widget(frame, theme, chat, (rw, rh), now);
+            }
             Content::Music(shown) => {
                 let MusicShown { music, layer, frames, busy, .. } = shown;
                 *frames += 1;
@@ -1605,6 +1618,7 @@ impl Content {
                 shown.music.release();
                 shown.layer.release();
             }
+            Content::Simo(_) => {}
             Content::Merged(merged) => merged.parts.iter_mut().for_each(Content::release),
         }
     }
@@ -1613,7 +1627,7 @@ impl Content {
     fn readings_mut(&mut self) -> Option<&mut Readings> {
         match self {
             Content::Readings(readings) => Some(readings),
-            Content::Music(_) => None,
+            Content::Music(_) | Content::Simo(_) => None,
             Content::Merged(merged) => merged.parts.iter_mut().find_map(Content::readings_mut),
         }
     }
@@ -1622,7 +1636,7 @@ impl Content {
     fn tab(&self) -> view::Tab {
         match self {
             Content::Readings(readings) => readings.tab,
-            Content::Music(_) => view::Tab::default(),
+            Content::Music(_) | Content::Simo(_) => view::Tab::default(),
             Content::Merged(merged) => merged.parts.iter().find(|part| matches!(part, Content::Readings(_))).map_or_else(view::Tab::default, Content::tab),
         }
     }
@@ -1640,7 +1654,7 @@ impl Content {
     fn readings_hits(&self) -> Vec<view::HitBox> {
         match self {
             Content::Readings(readings) => readings.hits.clone(),
-            Content::Music(_) => Vec::new(),
+            Content::Music(_) | Content::Simo(_) => Vec::new(),
             Content::Merged(merged) => merged.parts.iter().flat_map(Content::readings_hits).collect(),
         }
     }
@@ -1664,7 +1678,7 @@ impl Content {
         match self {
             Content::Readings(readings) => (readings.only.as_deref() == Some(only)).then_some(None),
             Content::Merged(merged) => merged.parts.iter().position(|part| part.holding(only).is_some()).map(Some),
-            Content::Music(_) => None,
+            Content::Music(_) | Content::Simo(_) => None,
         }
     }
 
@@ -1672,7 +1686,7 @@ impl Content {
     fn scrolls(&self) -> view::Scrolls {
         match self {
             Content::Readings(readings) => readings.scrolls,
-            Content::Music(_) => view::Scrolls::default(),
+            Content::Music(_) | Content::Simo(_) => view::Scrolls::default(),
             Content::Merged(merged) => merged.parts.iter().find(|part| matches!(part, Content::Readings(_))).map_or_else(view::Scrolls::default, Content::scrolls),
         }
     }
@@ -1683,7 +1697,7 @@ impl Content {
         match self {
             Content::Readings(readings) => readings.lanes,
             Content::Merged(merged) => merged.parts.iter().find_map(|part| if let Content::Readings(readings) = part { Some(readings.lanes) } else { None }).unwrap_or(crate::settings::Part::Monitor),
-            Content::Music(_) => crate::settings::Part::Monitor,
+            Content::Music(_) | Content::Simo(_) => crate::settings::Part::Monitor,
         }
     }
 
@@ -1732,7 +1746,7 @@ impl Content {
         let only = match self {
             Content::Readings(readings) => readings.only.clone(),
             Content::Merged(merged) => merged.parts.iter().find_map(|part| if let Content::Readings(readings) = part { readings.only.clone() } else { None }),
-            Content::Music(_) => None,
+            Content::Music(_) | Content::Simo(_) => None,
         };
         if let Some(only) = only {
             prefs.modules.retain(|module| module.id == only);
@@ -1747,7 +1761,7 @@ impl Content {
                 None => prefs.modules.push(crate::ui::prefs::ModuleEntry { id: "lyrics".into(), on: true, items: Default::default() }),
             },
             Content::Readings(_) | Content::Merged(_) => prefs.modules.retain(|module| module.id != "lyrics"),
-            Content::Music(_) => return None,
+            Content::Music(_) | Content::Simo(_) => return None,
         }
         Some(prefs)
     }
@@ -1775,6 +1789,7 @@ impl Content {
         match self {
             Content::Readings(_) => true,
             Content::Music(_) => music == MusicGround::Skin,
+            Content::Simo(_) => true,
             Content::Merged(merged) => !merged.host_plays() || music == MusicGround::Skin,
         }
     }
@@ -1784,6 +1799,7 @@ impl Content {
         match self {
             Content::Readings(readings) => readings.choice.form.key(),
             Content::Music(_) => MUSIC_FORM.into(),
+            Content::Simo(_) => "simo".into(),
             Content::Merged(merged) => format!("merged ({})", merged.parts.iter().map(Content::key).collect::<Vec<_>>().join(", ")),
         }
     }
@@ -1795,6 +1811,7 @@ impl Content {
             Content::Readings(readings) if readings.lanes != crate::settings::Part::Monitor => &[Button::Settings, Button::Pin, Button::Through, Button::Close],
             Content::Readings(_) => &buttons::ALL,
             Content::Music(_) => &[Button::Full, Button::Settings, Button::Pin, Button::Through, Button::Close],
+            Content::Simo(_) => &[Button::Settings, Button::Pin, Button::Through, Button::Close],
             // (With the readings' in it, as theirs; else with another component's lanes, as its.)
             Content::Merged(merged) => merged
                 .parts
@@ -1867,6 +1884,73 @@ impl Widgets {
         self.list.iter().any(|w| w.window.hwnd == hwnd)
     }
 
+    pub fn simo_press(&mut self, hwnd: HWND, client: POINT) -> bool {
+        let Some(index) = self.list.iter().position(|widget| widget.window.hwnd == hwnd && matches!(widget.content, Content::Simo(_))) else { return false };
+        let action = self.list[index].simo_press(client);
+        match action {
+            Some(SimoPress::Consumed) => true,
+            Some(SimoPress::Action(crate::ui::simo::Action::Expand)) => true,
+            Some(SimoPress::Action(crate::ui::simo::Action::Settings)) => { crate::show_settings(None); true }
+            Some(SimoPress::Action(crate::ui::simo::Action::Pin)) => {
+                self.list[index].pinned ^= true;
+                self.list[index].next_frame = Instant::now();
+                self.save();
+                true
+            }
+            Some(SimoPress::Action(crate::ui::simo::Action::Close)) => {
+                self.put_away_at(index);
+                self.save();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn simo_leave(&mut self, hwnd: HWND) -> bool {
+        let Some(widget) = self.list.iter_mut().find(|widget| widget.window.hwnd == hwnd) else { return false };
+        let Content::Simo(chat) = &mut widget.content else { return false };
+        if chat.hovered_action.take().is_some() { crate::ui::tip::hide(); }
+        chat.hovered_attachment = None;
+        chat.pointer = None;
+        widget.next_frame = Instant::now();
+        true
+    }
+
+    pub fn simo_selection(&mut self, hwnd: HWND, client: POINT, message: u32) -> bool {
+        let Some(widget) = self.list.iter_mut().find(|widget| widget.window.hwnd == hwnd) else { return false };
+        let px = widget.contact.scale * widget.zoom;
+        let margin = widget.margin_px();
+        let Content::Simo(chat) = &mut widget.content else { return false };
+        if !chat.selecting_text { return false; }
+        let x = (client.x - margin) as f32 / px;
+        let y = (client.y - margin) as f32 / px;
+        crate::ui::simo::follow_selection(chat, hwnd, &widget.gfx, widget.surface_size, x, y, message);
+        crate::ui::simo::place_ime(hwnd, widget.surface_size, chat, &widget.gfx, px, (margin, margin));
+        widget.next_frame = Instant::now();
+        true
+    }
+
+    pub fn simo_ime(&mut self, hwnd: HWND, composition: Option<String>, result: Option<String>) {
+        let Some(widget) = self.list.iter_mut().find(|widget| widget.window.hwnd == hwnd) else { return };
+        let px = widget.contact.scale * widget.zoom;
+        let margin = widget.margin_px();
+        let Content::Simo(chat) = &mut widget.content else { return };
+        if !chat.focused { return; }
+        chat.update_ime(composition, result);
+        crate::ui::simo::place_ime(hwnd, widget.surface_size, chat, &widget.gfx, px, (margin, margin));
+        widget.next_frame = Instant::now();
+    }
+
+    pub fn simo_key(&mut self, hwnd: HWND, message: u32, value: u16) -> bool {
+        let Some(widget) = self.list.iter_mut().find(|widget| widget.window.hwnd == hwnd && matches!(widget.content, Content::Simo(_))) else { return false };
+        widget.simo_key(message, value)
+    }
+
+    pub fn simo_files(&mut self, hwnd: HWND, paths: Vec<std::path::PathBuf>) -> bool {
+        let Some(widget) = self.list.iter_mut().find(|widget| widget.window.hwnd == hwnd && matches!(widget.content, Content::Simo(_))) else { return false };
+        widget.simo_files(paths)
+    }
+
     /// A widget torn off the panel: showing `form` at `scale` with its
     /// corner at `at` on `contact`'s screen, in hand, the pointer `grab`
     /// from its corner; on the desktop the panel had taken (`lent`: its
@@ -1875,10 +1959,12 @@ impl Widgets {
     /// was at, if it was at one; `part`: what the panel showed; `only`: the one lane of it it shows (torn off by that
     /// lane's head), if it shows one.
     #[allow(clippy::too_many_arguments)]
-    pub fn tear(&mut self, form: Form, scale: f32, at: POINT, grab: POINT, size: (f32, f32), lent: Option<Lent>, from: Option<Edge>, part: crate::settings::Part, only: Option<String>) -> bool {
-        let Some(contact) = monitor_at(at) else { return false };
+    pub fn tear(&mut self, form: Form, scale: f32, at: POINT, grab: POINT, size: (f32, f32), lent: Option<Lent>, from: Option<Edge>, part: crate::settings::Part, only: Option<String>, simo: Option<crate::simo::Chat>) -> bool {
+        let simo_drag = part == crate::settings::Part::Simo;
+        let pointer = POINT { x: at.x + grab.x, y: at.y + grab.y };
+        let Some(contact) = monitor_at(if simo_drag { pointer } else { at }) else { return false };
         // (Its top on the screen, not above it: torn off high, as the hand pulled it, it is held lower.)
-        let below = (contact.work.top - at.y).max(0);
+        let below = if simo_drag { 0 } else { (contact.work.top - at.y).max(0) };
         let (at, grab) = (POINT { y: at.y + below, ..at }, POINT { y: grab.y - below, ..grab });
         let choice = Choice { form, scale, extra: (0.0, 0.0) };
         let made = Instant::now();
@@ -1886,6 +1972,7 @@ impl Widgets {
         let content = match part {
             crate::settings::Part::Monitor | crate::settings::Part::Workbench | crate::settings::Part::Ai => Content::Readings(Readings { lanes: part, only, ..Readings::new(choice) }),
             crate::settings::Part::Music => Content::Music(MusicShown::new(size)),
+            crate::settings::Part::Simo => Content::Simo(simo.unwrap_or_default()),
         };
         let Some(mut widget) = Widget::new(contact, at, content) else { return false };
         let made = made.elapsed();
@@ -2077,7 +2164,7 @@ impl Widgets {
     pub fn captured(&mut self, hwnd: HWND) {
         let live = self.live;
         if let Some(widget) = self.list.iter_mut().find(|w| w.window.hwnd == hwnd) {
-            let live = live && widget.content.skinned(self.music_ground);
+            let live = live && widget.content.skinned(self.music_ground) && !matches!(widget.content, Content::Simo(_));
             if widget.look_behind(live) {
                 widget.next_frame = Instant::now();
             }
@@ -2139,7 +2226,8 @@ impl Widgets {
     /// desktop, as a widget showing all of each lane), once.
     fn restore(&mut self, kept: &[WidgetAt]) {
         self.restored = true;
-        self.list.extend(kept.iter().filter_map(Widget::restore));
+        self.put_away.extend(kept.iter().filter(|kept| standalone_simo(kept)).cloned());
+        self.list.extend(kept.iter().filter(|kept| !standalone_simo(kept)).filter_map(Widget::restore));
         if !self.adopted.is_empty() {
             let adopted = std::mem::take(&mut self.adopted);
             self.list.extend(adopted.iter().filter_map(Widget::restore));
@@ -2156,7 +2244,8 @@ impl Widgets {
     /// list never lands after a newer one.
     fn save(&self) {
         static SAVER: std::sync::OnceLock<std::sync::mpsc::Sender<Vec<WidgetAt>>> = std::sync::OnceLock::new();
-        let kept: Vec<WidgetAt> = self.list.iter().map(Widget::kept).collect();
+        let mut kept: Vec<WidgetAt> = self.list.iter().map(Widget::kept).collect();
+        kept.extend(self.put_away.iter().filter(|widget| standalone_simo(widget)).cloned());
         let saver = SAVER.get_or_init(|| {
             let (send, receive) = std::sync::mpsc::channel::<Vec<WidgetAt>>();
             std::thread::spawn(move || {
@@ -2217,6 +2306,25 @@ impl Widgets {
         let px = widget.contact.scale * widget.zoom;
         let margin = widget.margin_px();
         let (x, y) = ((client.x - margin) as f32 / px, (client.y - margin) as f32 / px);
+        let mut simo_action = None;
+        let mut simo_action_changed = false;
+        let mut simo_pointer_shape = None;
+        if let Content::Simo(chat) = &mut widget.content {
+            let size = widget.surface_size;
+            let draft = chat.composer_displayed_text();
+            let attachment = crate::ui::simo::attachment_hover(size, &draft, &widget.gfx, chat.expanded, chat.attachments.len(), x, y);
+            if attachment != chat.hovered_attachment {
+                chat.hovered_attachment = attachment;
+                widget.next_frame = Instant::now();
+            }
+            simo_action = crate::ui::simo::widget_header_action(size, x, y);
+            let key = simo_action.map(crate::ui::simo::action_id);
+            simo_action_changed = chat.hovered_action != key;
+            chat.hovered_action = key;
+            if chat.pointer.replace((x, y)).is_none() { crate::ui::simo::track_leave(hwnd); }
+            simo_pointer_shape = Some(crate::ui::simo::pointer_shape(chat, size, &widget.gfx, &draft, simo_action.is_some(), x, y));
+            widget.next_frame = Instant::now();
+        }
         // What the button under the pointer does, said under it.
         let over = widget.button_at(x, y);
         if over != widget.tip {
@@ -2239,6 +2347,20 @@ impl Widgets {
                     widget.saying = false;
                 }
                 _ => crate::ui::tip::hide(),
+            }
+        }
+        if simo_action_changed {
+            match simo_action {
+                Some(action) => {
+                    let center = Point { x: widget.surface_size.0 - 27.0, y: 30.0 };
+                    let on_screen = |dx: f32, dy: f32| ((widget.at.x as f32 + (center.x + dx) * px).round() as i32, (widget.at.y as f32 + (center.y + dy) * px).round() as i32);
+                    let ((left, top), (right, bottom)) = (on_screen(-14.0, -14.0), on_screen(14.0, 14.0));
+                    let expanded = matches!(&widget.content, Content::Simo(chat) if chat.expanded);
+                    let said = crate::ui::simo::action_label(action, expanded, widget.pinned, lang);
+                    crate::ui::tip::show(widget.window.hwnd, said, RECT { left, top, right, bottom }, crate::os::apps_dark());
+                }
+                None if over.is_none() => crate::ui::tip::hide(),
+                _ => {}
             }
         }
         // What a press there would open or do, lit (a drive's row, a player's button); an AI source in the dock, its
@@ -2283,7 +2405,7 @@ impl Widgets {
         }
         // (As a press there acts: see `takes_at`.)
         let shape = pointer_for(&widget.takes_at(x, y), over.is_some(), hit, writing.is_some_and(|in_place| in_place.on_menu_button(client, px)));
-        widget.window.point(shape);
+        widget.window.point(if over.is_none() { simo_pointer_shape.unwrap_or(shape) } else { shape });
     }
 
     /// Turns the process list under the pointer (`screen`, physical px) by the wheel's `delta`, as the panel's; or
@@ -2291,6 +2413,18 @@ impl Widgets {
     /// to the right on.
     pub fn wheel(&mut self, hwnd: HWND, screen: POINT, delta: i16, across: bool) {
         let Some(widget) = self.list.iter_mut().find(|w| w.window.hwnd == hwnd) else { return };
+        if matches!(widget.content, Content::Simo(_)) {
+            if across { return; }
+            let mut client = screen;
+            unsafe { let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut client); }
+            let px = widget.contact.scale * widget.zoom;
+            let margin = widget.margin_px();
+            let (x, y) = ((client.x - margin) as f32 / px, (client.y - margin) as f32 / px);
+            if let Content::Simo(chat) = &mut widget.content {
+                if crate::ui::simo::scroll_at(chat, x, y, delta) { widget.next_frame = Instant::now(); }
+            }
+            return;
+        }
         // What it shows where the wheel turned, as a press there finds it.
         let hit: Vec<view::Hit> = {
             let mut client = screen;
@@ -2674,6 +2808,27 @@ impl Widgets {
         self.list.iter().find(|w| w.window.hwnd == hwnd).map(Widget::rect)
     }
 
+    pub fn simo_history_at(&self, hwnd: HWND, client: POINT) -> Option<String> {
+        let widget = self.list.iter().find(|widget| widget.window.hwnd == hwnd)?;
+        let Content::Simo(chat) = &widget.content else { return None };
+        let px = widget.contact.scale * widget.zoom;
+        let margin = widget.margin_px();
+        let x = (client.x - margin) as f32 / px;
+        let y = (client.y - margin) as f32 / px;
+        match crate::ui::simo::history_action(chat, widget.surface_size, x, y) {
+            Some(crate::ui::simo::HistoryAction::Select(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn delete_simo_history(&mut self, hwnd: HWND, id: &str, lang: Lang) {
+        let Some(widget) = self.list.iter_mut().find(|widget| widget.window.hwnd == hwnd) else { return };
+        let Content::Simo(chat) = &mut widget.content else { return };
+        crate::ui::simo::delete_history(chat, id, hwnd, lang);
+        if !chat.focused { widget.window.take_keys(false); }
+        widget.next_frame = Instant::now();
+    }
+
     /// How a menu opened on the widget at `hwnd` looks: in its skin, light or dark and as frosted as it is drawn.
     pub fn look_of(&self, hwnd: HWND) -> crate::ui::menu::Look {
         self.list.iter().find(|w| w.window.hwnd == hwnd).map_or_else(crate::ui::menu::Look::system, Widget::menu_look)
@@ -2831,12 +2986,14 @@ impl Widgets {
             }
             // What is behind it, looked at as often as it is due, drawn only as it changes.
             let sees = look.skin.sees_backdrop() && widget.content.skinned(look.prefs.music.ground);
-            if sees && widget.look_behind(self.live && sees) {
+            let simo = matches!(widget.content, Content::Simo(_));
+            let live = self.live && sees && !simo;
+            if sees && widget.look_behind(live) {
                 widget.next_frame = now;
             }
-            let behind_due = widget.backdrop_wait(self.live && sees);
+            let behind_due = widget.backdrop_wait(live);
             // (Windows behind it changed: put together again now, live.)
-            if sees && widget.windows_moved_behind(now, self.live) {
+            if sees && !simo && widget.windows_moved_behind(now, live) {
                 widget.next_frame = now;
             }
             // Drawn when it is due: in hand, flung or turning, at once; else
@@ -2874,8 +3031,7 @@ impl Widgets {
                     widget.next_frame = now + rest;
                     due = due.min(rest);
                     // (What is behind looked at sooner, a frame of it having come: drawn only if it changed.)
-                    let sees = look.skin.sees_backdrop() && widget.content.skinned(look.prefs.music.ground);
-                    if let Some(wait) = widget.backdrop_wait(self.live && sees) {
+                    if let Some(wait) = widget.backdrop_wait(live) {
                         due = due.min(wait);
                     }
                 }
@@ -3053,6 +3209,11 @@ enum Released {
     Full,
     /// One of its station's head's buttons pressed: its menu asked for.
     Menu(view::Hit),
+}
+
+enum SimoPress {
+    Consumed,
+    Action(crate::ui::simo::Action),
 }
 
 enum Frame {
@@ -3403,16 +3564,19 @@ impl Widget {
         // (On the device of its screen's adapter: see `gfx::on_screen`.)
         let gfx = gfx::for_area(contact.monitor).ok()?;
         let window = Window::new().ok()?;
+        unsafe { windows::Win32::UI::Shell::DragAcceptFiles(window.hwnd, true); }
         window.under_the_panel();
         let surface = Surface::new(&gfx, window.hwnd).ok();
         Some(Widget {
             window,
             gfx,
             surface,
+            simo_ground: render::GroundLayers::default(),
             content,
             showing: None,
             contact,
             at,
+            simo_return_at: None,
             room: None,
             settle: None,
             pulled: None,
@@ -3502,6 +3666,7 @@ impl Widget {
                 // (As large as it was kept: grown already, as it was merged.)
                 Content::Merged(Box::new(Merged { grown: kept.size.is_some(), ..Merged::new(parts, kept.beside, kept.size.unwrap_or(music::LEAST)) }))
             }
+            _ if kept.layout.form == "simo" => Content::Simo(crate::simo::Chat::open(&crate::app().settings.lock().unwrap().simo.clone())),
             _ => one(&kept.layout)?,
         };
         let mut widget = Widget::new(contact, at, content)?;
@@ -3523,6 +3688,7 @@ impl Widget {
         let (layout, size, parts, beside) = match &self.content {
             Content::Readings(readings) => (readings.kept(), None, None, false),
             Content::Music(shown) => (layout_of(&self.content), Some(shown.size), None, false),
+            Content::Simo(_) => (crate::settings::PanelLayout { form: "simo".into(), scale: 1.0, extra: (0.0, 0.0), lanes: crate::settings::Part::Simo, ai_source: None }, None, None, false),
             Content::Merged(merged) => (layout_of(&merged.parts[0]), Some(merged.size), Some(merged.parts.iter().map(layout_of).collect()), merged.beside),
         };
         WidgetAt {
@@ -3919,7 +4085,12 @@ impl Widget {
                 }
             }
             Takes::Whole => {
-                self.drag = Some(Drag::Move { grab: POINT { x: from.x - self.at.x, y: from.y - self.at.y }, trail: Vec::new(), torn: false, moved: false });
+                let grab = if matches!(self.content, Content::Simo(_)) {
+                    POINT { x: client.x - margin, y: client.y - margin }
+                } else {
+                    POINT { x: from.x - self.at.x, y: from.y - self.at.y }
+                };
+                self.drag = Some(Drag::Move { grab, trail: Vec::new(), torn: false, moved: false });
                 self.splitting = match &self.content {
                     Content::Merged(merged) => merged.part_at((x, y)).filter(|(part, _)| *part > 0),
                     _ => None,
@@ -3944,6 +4115,159 @@ impl Widget {
         });
     }
 
+    fn simo_press(&mut self, client: POINT) -> Option<SimoPress> {
+        let px = self.contact.scale * self.zoom;
+        let margin = self.margin_px();
+        let (x, y) = ((client.x - margin) as f32 / px, (client.y - margin) as f32 / px);
+        let size = self.surface_size;
+        let hwnd = self.window.hwnd;
+        let gfx = self.gfx.clone();
+        let Content::Simo(chat) = &mut self.content else { return None };
+        if let Some(action) = crate::ui::simo::widget_header_action(size, x, y) {
+            if action == crate::ui::simo::Action::Expand {
+                if chat.expanded {
+                    if let Some(at) = self.simo_return_at.take() { self.at = at; }
+                } else {
+                    self.simo_return_at = Some(self.at);
+                }
+                chat.expanded = !chat.expanded;
+                chat.edit_rect = None;
+                chat.reply_hits.clear();
+                self.next_frame = Instant::now();
+            }
+            return Some(SimoPress::Action(action));
+        }
+        if let Some(action) = crate::ui::simo::history_action(chat, size, x, y) {
+            match action {
+                crate::ui::simo::HistoryAction::New => { chat.new_conversation(); chat.history_page = 0; }
+                crate::ui::simo::HistoryAction::Select(id) => { chat.select_conversation(&id); chat.history_page = 0; }
+                crate::ui::simo::HistoryAction::Previous => chat.history_page = chat.history_page.saturating_sub(1),
+                crate::ui::simo::HistoryAction::Next => chat.history_page += 1,
+            }
+            self.next_frame = Instant::now();
+            return Some(SimoPress::Consumed);
+        }
+        if crate::ui::simo::press_editor(chat, &gfx, &self.window, x, y) || crate::ui::simo::press_reply(chat, hwnd, x, y) {
+            if chat.editing_focused && chat.focused {
+                crate::ui::simo::place_ime(hwnd, size, chat, &gfx, px, (margin, margin));
+            } else if !chat.focused {
+                self.window.take_keys(false);
+            }
+            self.next_frame = Instant::now();
+            return Some(SimoPress::Consumed);
+        }
+        let shown = chat.composer_displayed_text();
+        if let Some(index) = crate::ui::simo::attachment_remove_at(size, &shown, &gfx, chat.expanded, chat.attachments.len(), x, y) {
+            chat.attachments.remove(index);
+            chat.hovered_attachment = None;
+            self.next_frame = Instant::now();
+            return Some(SimoPress::Consumed);
+        }
+        let Some(action) = crate::ui::simo::input_action(size, &shown, &gfx, chat.expanded, chat.attachments.len(), x, y) else {
+            let input = crate::ui::simo::input_rect_with_attachments(size, &shown, &gfx, chat.expanded, chat.attachments.len());
+            if crate::ui::simo::widget_drag_handle(size, input, x, y) {
+                chat.blur();
+                self.window.take_keys(false);
+                self.next_frame = Instant::now();
+                return None;
+            }
+            if x >= 0.0 && x < size.0 && y >= 0.0 && y < size.1 {
+                chat.blur();
+                self.window.take_keys(false);
+                self.next_frame = Instant::now();
+                return Some(SimoPress::Consumed);
+            }
+            return None;
+        };
+        match action {
+            crate::ui::simo::InputAction::Text => {
+                self.window.take_simo_keys();
+                crate::ui::simo::select_draft(chat, size, &gfx, hwnd, x, y);
+                crate::ui::simo::place_ime(hwnd, size, chat, &gfx, px, (margin, margin));
+            }
+            crate::ui::simo::InputAction::Attach => {
+                chat.focus_editor(false);
+                self.window.take_simo_keys();
+                crate::ui::simo::place_ime(hwnd, size, chat, &gfx, px, (margin, margin));
+                for path in crate::simo::choose_files(self.window.hwnd) {
+                    if let Ok(attachment) = crate::simo::Attachment::from_path(&path) {
+                        chat.attachments.push(attachment);
+                    }
+                }
+            }
+            crate::ui::simo::InputAction::Send => {
+                let settings = crate::app().settings.lock().unwrap().simo.clone();
+                chat.send(settings);
+            }
+        }
+        self.next_frame = Instant::now();
+        Some(SimoPress::Consumed)
+    }
+
+    fn simo_key(&mut self, message: u32, value: u16) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SHIFT};
+        use windows::Win32::UI::WindowsAndMessaging::WM_CHAR;
+        let hwnd = self.window.hwnd;
+        let size = self.surface_size;
+        let px = self.contact.scale * self.zoom;
+        let margin = self.margin_px();
+        let gfx = self.gfx.clone();
+        let Content::Simo(chat) = &mut self.content else { return false };
+        if !chat.focused { return false; }
+        match message {
+            WM_CHAR if value >= 0x20 && value != 0x7F => chat.type_utf16(value),
+            WM_CHAR => return true,
+            windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN => match VIRTUAL_KEY(value) {
+                VK_ESCAPE if chat.editing_focused => chat.cancel_edit(),
+                VK_ESCAPE => chat.blur(),
+                VK_RETURN if !chat.composition.is_empty() => {}
+                VK_RETURN if unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 => chat.insert_text("\n"),
+                VK_RETURN => {
+                    let settings = crate::app().settings.lock().unwrap().simo.clone();
+                    if chat.editing_focused { chat.send_edit(settings); }
+                    else { chat.send(settings); }
+                }
+                _ if crate::ui::simo::edit_input(chat, hwnd, message, value) => {}
+                _ => return true,
+            },
+            _ => return true,
+        }
+        if chat.focused {
+            crate::ui::simo::place_ime(hwnd, size, chat, &gfx, px, (margin, margin));
+        } else {
+            self.window.take_keys(false);
+        }
+        self.next_frame = Instant::now();
+        true
+    }
+
+    fn simo_files(&mut self, paths: Vec<std::path::PathBuf>) -> bool {
+        let hwnd = self.window.hwnd;
+        let size = self.surface_size;
+        let px = self.contact.scale * self.zoom;
+        let margin = self.margin_px();
+        let gfx = self.gfx.clone();
+        let added = {
+            let Content::Simo(chat) = &mut self.content else { return false };
+            let mut added = false;
+            for path in paths {
+                if let Ok(attachment) = crate::simo::Attachment::from_path(&path) {
+                    chat.attachments.push(attachment);
+                    added = true;
+                }
+            }
+            if added { chat.focus(); }
+            added
+        };
+        if added {
+            self.window.take_simo_keys();
+            if let Content::Simo(chat) = &mut self.content {
+                crate::ui::simo::place_ime(hwnd, size, chat, &gfx, px, (margin, margin));
+            }
+        }
+        self.next_frame = Instant::now();
+        true
+    }
     /// The card beside it, as it was just drawn in `theme` from `prefs`: of the spot of the AI component's dock the
     /// pointer is on (what every source spent today, a source's ring, the sessions at work), or of the folder in the
     /// storage lane it rests on, on the side of the screen with more room (under or over it, laid across); else none.
@@ -4060,8 +4384,20 @@ impl Widget {
             self.swipe(now);
             return;
         }
-        let Some(cursor) = cursor_position() else { return };
+        if let Some(cursor) = cursor_position() {
+            self.follow_at(now, cursor);
+        }
+    }
+
+    fn follow_at(&mut self, now: Instant, cursor: POINT) {
         let scale = self.contact.scale;
+        let direct = matches!(self.content, Content::Simo(_)) && match self.drag {
+            Some(Drag::Move { grab, .. }) => {
+                let px = scale * self.zoom;
+                self.button_at(grab.x as f32 / px, grab.y as f32 / px).is_none()
+            }
+            _ => false,
+        };
         // Pressed on pages and gone far enough across them before down: they are swiped (pinned too: that is not
         // moving it).
         if let Some(Drag::Move { grab, moved: false, .. }) = self.drag {
@@ -4081,7 +4417,7 @@ impl Widget {
                 let to = POINT { x: cursor.x - grab.x, y: cursor.y - grab.y };
                 if !*moved {
                     let (dx, dy) = ((to.x - self.at.x) as f32 / scale, (to.y - self.at.y) as f32 / scale);
-                    if dx.hypot(dy) < MOVE_FROM {
+                    if (direct && to == self.at) || (!direct && dx.hypot(dy) < MOVE_FROM) {
                         return;
                     }
                     *moved = true;
@@ -4103,7 +4439,7 @@ impl Widget {
                         Side::Bottom => work.bottom - (to.y + h as i32),
                     } as f32
                         / scale;
-                    if away > UNSTICK {
+                    if direct || away > UNSTICK {
                         self.stuck = None;
                         self.along = None;
                         self.also = None;
@@ -4341,7 +4677,7 @@ impl Widget {
                                                 shown.music.back_to_now();
                                             }
                                         }),
-                                        Content::Readings(_) => {}
+                                        Content::Readings(_) | Content::Simo(_) => {}
                                     }
                                 }
                                 _ => {}
@@ -4637,7 +4973,7 @@ impl Widget {
         let readings: Vec<&mut Readings> = match &mut self.content {
             Content::Readings(readings) => vec![readings],
             Content::Merged(merged) => merged.parts.iter_mut().filter_map(|part| if let Content::Readings(readings) = part { Some(readings) } else { None }).collect(),
-            Content::Music(_) => Vec::new(),
+            Content::Music(_) | Content::Simo(_) => Vec::new(),
         };
         for readings in readings {
             readings.scrolls.follow(view::lists_show(readings.tab));
@@ -4777,6 +5113,13 @@ impl Widget {
                 self.zoom = 1.0;
                 self.shown = shown.size;
                 moving |= shown.busy;
+            }
+            Content::Simo(chat) => {
+                chat.poll();
+                self.zoom = 1.0;
+                let size = if chat.expanded { (940.0, 760.0) } else { (crate::ui::simo::WIDTH, crate::ui::simo::HEIGHT) };
+                self.shown = within(size, (180.0, 220.0));
+                moving |= chat.requesting() || chat.focused || crate::ui::simo::scrolling(chat);
             }
             // Merged: laid out in the room it is given, no less than its parts need at their least.
             Content::Merged(merged) => {
@@ -4939,7 +5282,8 @@ impl Widget {
         // comes.)
         self.follow_device();
         let sees = look.skin.sees_backdrop() && self.content.skinned(look.prefs.music.ground);
-        let live = look.live && sees;
+        let simo = matches!(self.content, Content::Simo(_));
+        let live = look.live && sees && !simo;
         if !sees {
             self.unsee();
         }
@@ -4966,7 +5310,7 @@ impl Widget {
             other_screen || past
         });
         let retake = self.retake && self.drag.is_none() && !sizing;
-        let moved_behind = self.windows_moved_behind(now, live);
+        let moved_behind = !simo && self.windows_moved_behind(now, live);
         let due = self.behind.is_none() || self.replace.is_some() || elsewhere || retake || moved_behind;
         // None could be taken last time (the lock screen): not again at once.
         let rested = self.failed.is_none_or(|at| now.saturating_duration_since(at) >= RETAKE_EVERY);
@@ -5041,7 +5385,8 @@ impl Widget {
         }
         // Nothing yet behind a skin that sees it: drawn once it is there
         // (as it shows for the first time, it shows on it).
-        if sees && self.behind.is_none() {
+        let simo_in_hand = simo && matches!(self.drag, Some(Drag::Move { moved: true, .. }));
+        if sees && self.behind.is_none() && !simo_in_hand {
             return Frame::Waiting;
         }
         // Drawn light or dark as the desktop behind it is, now that it has
@@ -5182,6 +5527,7 @@ impl Widget {
         let mut card_gone = false;
         let behind = &mut self.behind;
         let content = &mut self.content;
+        let simo_ground = &mut self.simo_ground;
         let Some(surface) = self.surface.as_mut() else { return };
         let pixels = ((window.right - window.left) as u32, (window.bottom - window.top) as u32);
         // Every layer of it drawn (see below).
@@ -5246,6 +5592,18 @@ impl Widget {
                         whole &= drawn_whole;
                         pressed = hits.map(|hits| (hits, at)).or(pressed.take());
                     }
+                }
+                Content::Simo(chat) => {
+                    let backdrop = behind.as_mut().and_then(|behind| behind.backdrop(&frame.dc, contact_scale, window, px, margin));
+                    if theme.skin.sees_backdrop() {
+                        if let Err(error) = simo_ground.draw_whole(frame, theme, size, backdrop, frost, rough, local, px) {
+                            note(format!("widget: SIMO glass not drawn: {error}"));
+                            whole = false;
+                            frame.fail(error);
+                        }
+                    }
+                    drawn_in(frame, local, || crate::ui::simo::paint_widget(frame, theme, chat, size, now));
+                    pressed = Some((Vec::new(), (0.0, 0.0)));
                 }
                 // What plays, drawn anew in its layer (round it, the room for its shadow).
                 Content::Music(shown) => {
@@ -5442,6 +5800,7 @@ impl Widget {
     fn shows_full(&self) -> bool {
         match &self.content {
             Content::Music(_) => true,
+            Content::Simo(_) => false,
             Content::Merged(merged) => merged.parts.iter().any(|part| matches!(part, Content::Music(_))),
             Content::Readings(_) => false,
         }
@@ -5591,6 +5950,48 @@ mod tests {
         }
         let lanes = Choice { form: Form::Lanes { detail: view::Detail::Full, columns: 1 }, scale: 1.0, extra: (20.0, -100.0) };
         assert_eq!(made_size(lanes, designed, 3, theme.radius), (view::COLUMN_WIDTH + 20.0, 520.0));
+    }
+
+    #[test]
+    fn simo_follows_the_first_physical_pixel_even_when_docked() {
+        let start = POINT { x: 0, y: 120 };
+        let contact = monitor_at(POINT { x: 100, y: 150 }).unwrap();
+        let mut widget = Widget::new(contact, start, Content::Simo(crate::simo::Chat::default())).unwrap();
+        widget.surface_size = (340.0, 440.0);
+        widget.stuck = Some(Side::Left);
+        widget.along = Some(200);
+        let grab = POINT { x: 100, y: 26 };
+        widget.drag = Some(Drag::Move { grab, trail: Vec::new(), torn: false, moved: false });
+        let now = Instant::now();
+        let pointer = |dx, dy| POINT { x: start.x + grab.x + dx, y: start.y + grab.y + dy };
+        widget.follow_at(now, pointer(0, 0));
+        let clicked = widget.stuck == Some(Side::Left) && matches!(widget.drag, Some(Drag::Move { moved: false, .. }));
+        widget.follow_at(now, pointer(1, 0));
+        let first = (widget.at, widget.stuck, widget.along);
+        widget.follow_at(now, pointer(14, -9));
+        let next = widget.at;
+        drop(widget);
+        gfx::let_go();
+        assert!(clicked);
+        assert_eq!(first, (POINT { x: start.x + 1, y: start.y }, None, None));
+        assert_eq!(next, POINT { x: start.x + 14, y: start.y - 9 });
+    }
+
+    #[test]
+    fn only_standalone_simo_is_deferred_on_startup() {
+        let simo = WidgetAt { at: (0, 0), layout: crate::settings::PanelLayout { form: "simo".into(), scale: 1.0, extra: (0.0, 0.0), lanes: crate::settings::Part::Simo, ai_source: None }, pinned: false, click_through: false, game_only: false, on_desktop: false, stuck: None, corner: None, size: None, parts: None, beside: false, before: None };
+        assert!(standalone_simo(&simo));
+        let mut merged = simo.clone();
+        merged.parts = Some(vec![simo.layout.clone()]);
+        assert!(!standalone_simo(&merged));
+    }
+
+    #[test]
+    fn simo_uses_the_selected_skin_independently_of_music_ground() {
+        let simo = Content::Simo(crate::simo::Chat::default());
+        for ground in [MusicGround::Cover, MusicGround::Skin, MusicGround::Clear] {
+            assert!(simo.skinned(ground));
+        }
     }
 
     /// A note pulled off the panel is its card while the pointer is over the panel, and a note off it (none to be had:

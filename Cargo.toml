@@ -30,6 +30,8 @@ markup5ever_rcdom = "=0.39.0+unofficial"
 miniz_oxide = "0.9"
 # Finding words among every file name on a drive at once (searched as Everything does).
 memchr = "2"
+# Office Open XML attachments are ZIP containers; only the in-process deflate reader is needed.
+zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
 
 # macOS's own APIs: the kernel's counters, and IOKit for drives, graphics,
 # sensors and power.
@@ -109,6 +111,7 @@ features = [
     "Win32_NetworkManagement_WiFi",
     "Win32_Networking_WinHttp",
     "Win32_Networking_WinSock",
+    "Win32_Networking_WinHttp",
     "Win32_System_HostComputeSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",

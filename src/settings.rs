@@ -199,10 +199,12 @@ pub enum Part {
     Music,
     /// What AI tools have spent and what is left of their limits.
     Ai,
+    /// The SIMO GPT conversation.
+    Simo,
 }
 
 /// Every component there is, in the order the settings offer them.
-pub const PARTS: [Part; 4] = [Part::Monitor, Part::Workbench, Part::Music, Part::Ai];
+pub const PARTS: [Part; 5] = [Part::Monitor, Part::Workbench, Part::Music, Part::Ai, Part::Simo];
 
 /// What an edge holding the AI component opens: its card (a panel of its lanes, as the readings'), or its dock (a
 /// narrow strip down the edge, a ring for each source, across a top edge; each source's card beside it as the pointer
@@ -798,7 +800,7 @@ impl PanelSizes {
             Part::Monitor => &self.monitor,
             Part::Workbench => &self.workbench,
             Part::Ai => &self.ai,
-            Part::Music => return 1.0,
+            Part::Music | Part::Simo => return 1.0,
         };
         sized.get(screen.unwrap_or_default()).copied().unwrap_or(otherwise)
     }
@@ -935,6 +937,9 @@ pub struct Settings {
     pub widgets: Vec<WidgetAt>,
     /// The player music is followed from, while it plays (see `media::choose_music`); none: as Glance picks.
     pub music_source: Option<MusicSource>,
+    /// SIMO's provider, model and voice output settings.
+    #[serde(default)]
+    pub simo: crate::simo::Settings,
     /// The station's (see `station`).
     #[serde(default)]
     pub station: StationSettings,
@@ -1057,6 +1062,8 @@ pub enum NotesView {
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StationSettings {
+    /// Whether visible windows are listed before quick launch on the workbench rail.
+    pub running_windows: bool,
     /// What is copied kept in Recently copied.
     pub history: bool,
     /// The files come lately listed (see `station::recent`).
@@ -1077,7 +1084,7 @@ pub struct StationSettings {
 
 impl Default for StationSettings {
     fn default() -> Self {
-        StationSettings { history: true, recent: true, view: ShelfView::Cards, copies_view: ShelfView::List, recent_view: ShelfView::List, folded: PinsFolded { shelf: false, copies: false, recent: false }, keep_days: 7, always_copy: false, remove_after_drag: false }
+        StationSettings { running_windows: true, history: true, recent: true, view: ShelfView::Cards, copies_view: ShelfView::List, recent_view: ShelfView::List, folded: PinsFolded { shelf: false, copies: false, recent: false }, keep_days: 7, always_copy: false, remove_after_drag: false }
     }
 }
 
@@ -1173,6 +1180,7 @@ impl Default for Settings {
             music_rooms: MusicRooms::default(),
             widgets: Vec::new(),
             music_source: None,
+            simo: crate::simo::Settings::default(),
             station: StationSettings::default(),
             recent_hidden: Vec::new(),
             recent_hidden_drives: Vec::new(),
@@ -1218,7 +1226,7 @@ impl Settings {
             Part::Monitor => &mut self.part_sizes.monitor,
             Part::Workbench => &mut self.part_sizes.workbench,
             Part::Ai => &mut self.part_sizes.ai,
-            Part::Music => return,
+            Part::Music | Part::Simo => return,
         };
         sized.insert(screen.unwrap_or_default().to_string(), size);
     }
@@ -1228,7 +1236,7 @@ impl Settings {
         match part {
             Part::Workbench => self.workbench_columns,
             Part::Ai => self.ai_columns,
-            Part::Monitor | Part::Music => self.columns,
+            Part::Monitor | Part::Music | Part::Simo => self.columns,
         }
     }
 
@@ -1237,7 +1245,7 @@ impl Settings {
         match part {
             Part::Workbench => self.workbench_columns = columns,
             Part::Ai => self.ai_columns = columns,
-            Part::Monitor | Part::Music => self.columns = columns,
+            Part::Monitor | Part::Music | Part::Simo => self.columns = columns,
         }
     }
 

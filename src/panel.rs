@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, SetForegroundWindow, SC_RESTORE, WM_SYSCOMMAND};
-use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN, HDROP};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PeekMessageW, PostMessageW, SetTimer, SystemParametersInfoW, HWND_MESSAGE, MSG, PM_REMOVE,
     QS_ALLINPUT, WM_HOTKEY,
     SPI_GETCLIENTAREAANIMATION, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONUP, WM_MOUSEMOVE, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT,
-    WM_TIMER,
+    WM_TIMER, WM_DROPFILES,
 };
 
 use crate::mouse::{cursor_position, cursor_showing, monitor_at, read_mouse, Contact, CORNER_EXCLUSION};
@@ -183,6 +183,10 @@ const PUSHED: u32 = WM_APP + 14;
 const HEARING_CHANGED: u32 = WM_APP + 15;
 /// Something this thread looks at changed elsewhere (it takes it up as it wakes: see `Controller::wake`).
 const WAKE: u32 = WM_APP + 16;
+/// A file was dropped on a SIMO screen edge (see `Controller::simo_dropped`).
+const SIMO_DROP: u32 = WM_APP + 137;
+
+static SIMO_DROPS: Mutex<Vec<(POINT, Edge, Vec<std::path::PathBuf>)>> = Mutex::new(Vec::new());
 
 /// The panel thread's own hotkey: Escape, while the panel is open.
 const ESCAPE_HOTKEY: i32 = 1;
@@ -368,6 +372,12 @@ impl Controller {
             let edge = EDGES.iter().position(|e| *e == edge).unwrap_or(0);
             let _ = unsafe { PostMessageW(Some(HWND(sink as *mut _)), PUSHED, WPARAM(edge), LPARAM(point_param(at.0, at.1))) };
         }
+    }
+
+    /// Delivers paths dropped on a configured SIMO edge to the panel's UI thread.
+    pub fn simo_dropped(&self, point: POINT, edge: Edge, paths: Vec<std::path::PathBuf>) {
+        SIMO_DROPS.lock().unwrap().push((point, edge, paths));
+        self.post(SIMO_DROP);
     }
 
     /// The sensors' process went, or came: the edges are watched on the panel's thread while there is none, by it while
@@ -888,6 +898,10 @@ impl Controller {
                         // already, as two were kept for one edge, left as it is).
                         if let Some(contact) = monitor_at(point) {
                             let edge = panels[0].pinned_edge(point, contact, edge);
+                            let simo_edge = crate::screens::id_of(contact.monitor).and_then(|id| self.config.lock().unwrap().edges.places.part(&id, edge)) == Some(Part::Simo);
+                            if simo_edge {
+                                continue;
+                            }
                             if panels.iter().any(|panel| panel.at(contact.monitor, edge)) {
                                 continue;
                             }
@@ -956,7 +970,30 @@ impl Controller {
             // A press on the panel, or while its menu is up (which takes every press: one away from it only closes
             // it): one of its own, not one elsewhere (see `Panel::track`).
             // The panel whose window the message is for, where it is one's.
+            for (hwnd, composition, result) in crate::ui::window::take_simo_ime() {
+                if let Some(panel) = panels.iter_mut().find(|panel| panel.part == Part::Simo && panel.window.hwnd == hwnd) {
+                    if panel.simo.focused {
+                        panel.simo.update_ime(composition, result);
+                        panel.place_simo_ime();
+                        panel.next_frame = Instant::now();
+                    }
+                } else {
+                    widgets.simo_ime(hwnd, composition, result);
+                }
+            }
             let owner = panels.iter().position(|panel| panel.window.hwnd == msg.hwnd);
+            if matches!(msg.message, WM_MOUSEMOVE | WM_LBUTTONUP | crate::ui::window::CAPTURE_LOST) {
+                let client = lparam_point(msg.lParam);
+                if let Some(at) = owner.filter(|&at| panels[at].part == Part::Simo && panels[at].simo.selecting_text) {
+                    let panel = &mut panels[at];
+                    let (x, y, size) = panel.simo_local(client).unwrap_or_default();
+                    crate::ui::simo::follow_selection(&mut panel.simo, msg.hwnd, &panel.gfx, size, x, y, msg.message);
+                    panel.place_simo_ime();
+                    panel.next_frame = Instant::now();
+                    continue;
+                }
+                if widgets.simo_selection(msg.hwnd, client, msg.message) { continue; }
+            }
             if matches!(msg.message, windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN | windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONDOWN | windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONDOWN)
                 && (owner.is_some() || menu.as_ref().is_some_and(|(open, _)| open.owns(msg.hwnd)) || crate::ui::todo::pick::owns(msg.hwnd) || crate::ui::rename::owns(msg.hwnd))
             {
@@ -1067,7 +1104,8 @@ impl Controller {
             // then not again till the pointer has left the edge).
             // (That edge's panel: the one up there already, which stays as it is, else one opened there.)
             let open_pushed = |(cursor, contact, edge): crate::push::Pushed, panels: &mut Vec<Panel<'s>>, last_place: &mut Option<(POINT, Edge)>| {
-                if may_open(fullscreen_edge) {
+                let simo_edge = crate::screens::id_of(contact.monitor).and_then(|id| self.config.lock().unwrap().edges.places.part(&id, edge)) == Some(Part::Simo);
+                if may_open(fullscreen_edge) || simo_edge {
                     let at = panel_for(panels, self, contact.monitor, edge);
                     if !panels[at].is_open() {
                         panels[at].open(cursor, contact, edge, None, true, now);
@@ -1113,7 +1151,8 @@ impl Controller {
                 };
                 if now.duration_since(since) >= SEAM_DWELL {
                     seam_rest = None;
-                    if may_open(fullscreen_edge) {
+                    let simo_edge = crate::screens::id_of(contact.monitor).and_then(|id| self.config.lock().unwrap().edges.places.part(&id, edge)) == Some(Part::Simo);
+                    if may_open(fullscreen_edge) || simo_edge {
                         let at = panel_for(panels, self, contact.monitor, edge);
                         panels[at].open(cursor, contact, edge, None, true, now);
                         *last_place = Some((cursor, edge));
@@ -1357,6 +1396,47 @@ impl Controller {
                 // (A look up from it, or a widget: a press on a thing on it that may be looked at shows that one, and does
                 // nothing more, its button's coming up too. One elsewhere on it closes the look up from it, and is a press
                 // as ever.)
+                WM_DROPFILES if owner.is_some_and(|at| panels[at].part == Part::Simo) => {
+                    let panel = &mut panels[owner.unwrap()];
+                    let drop = HDROP(msg.wParam.0 as *mut _);
+                    let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
+                    let mut paths = Vec::new();
+                    for index in 0..count {
+                        let length = unsafe { DragQueryFileW(drop, index, None) as usize };
+                        let mut path = vec![0u16; length + 1];
+                        let actual = unsafe { DragQueryFileW(drop, index, Some(&mut path)) as usize };
+                        path.truncate(actual);
+                        paths.push(std::path::PathBuf::from(String::from_utf16_lossy(&path)));
+                    }
+                    unsafe { DragFinish(drop) };
+                    panel.simo_files(paths);
+                }
+                WM_DROPFILES if widgets.owns(msg.hwnd) => {
+                    let drop = HDROP(msg.wParam.0 as *mut _);
+                    let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
+                    let mut paths = Vec::new();
+                    for index in 0..count {
+                        let length = unsafe { DragQueryFileW(drop, index, None) as usize };
+                        let mut path = vec![0u16; length + 1];
+                        let actual = unsafe { DragQueryFileW(drop, index, Some(&mut path)) as usize };
+                        path.truncate(actual);
+                        paths.push(std::path::PathBuf::from(String::from_utf16_lossy(&path)));
+                    }
+                    unsafe { DragFinish(drop) };
+                    widgets.simo_files(msg.hwnd, paths);
+                }
+                WM_KEYDOWN | windows::Win32::UI::WindowsAndMessaging::WM_CHAR if owner.is_some_and(|at| panels[at].part == Part::Simo) => {
+                    let panel = &mut panels[owner.unwrap()];
+                    if msg.message == WM_KEYDOWN {
+                        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg) };
+                    }
+                    panel.simo_key(msg.message, msg.wParam.0 as u16);
+                }
+                WM_KEYDOWN | windows::Win32::UI::WindowsAndMessaging::WM_CHAR if widgets.owns(msg.hwnd) && widgets.simo_key(msg.hwnd, msg.message, msg.wParam.0 as u16) => {
+                    if msg.message == WM_KEYDOWN {
+                        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg) };
+                    }
+                }
                 WM_LBUTTONDOWN if owner.is_some() => {
                     let panel = &panels[owner.unwrap()];
                     let window = panel.window.hwnd;
@@ -1436,10 +1516,15 @@ impl Controller {
                 }
                 // (The pointer taken from it as a thing on its station was pressed: nothing pressed.)
                 crate::ui::window::CAPTURE_LOST if owner.is_some_and(|at| panels[at].shelf_press.is_some()) => panels[owner.unwrap()].shelf_press = None,
-                WM_TIMER if owner.is_some_and(|at| panels[at].held()) => {
+                message @ (WM_TIMER | WM_MOUSEMOVE) if owner.is_some_and(|at| {
+                    let panel = &panels[at];
+                    if message == WM_TIMER { panel.held() } else {
+                        panel.part == Part::Simo && panel.drag.is_some_and(|drag| !drag.edges.any()) && !let_go(&msg)
+                    }
+                }) => {
                     let panel = &mut panels[owner.unwrap()];
                     panel.dragged(now);
-                    if let Some((form, scale, at, grab, size, only)) = panel.tear.take() {
+                    if let Some((form, scale, at, grab, size, only, simo)) = panel.tear.take() {
                         // The widget takes the desktop behind it before the
                         // panel goes: without the panel in it (it is put back
                         // in captures as it goes).
@@ -1452,7 +1537,7 @@ impl Controller {
                         });
                         // The edge it was at, unless it had been moved away.
                         let from = panel.placement.as_ref().filter(|placement| placement.floating.is_none()).map(|_| panel.edge);
-                        if widgets.tear(form, scale, at, grab, size, lent, from, panel.part, only) {
+                        if widgets.tear(form, scale, at, grab, size, lent, from, panel.part, only, simo) {
                             crate::ui::settings_window::guide::saw(crate::ui::settings_window::guide::Saw::Torn);
                         } else {
                             panel.torn = false;
@@ -1518,6 +1603,7 @@ impl Controller {
                 }
                 // The desktop widgets: pressed, let go (or found let go as the pointer moves: the button up unheard,
                 // let go before it was torn off), their menu.
+                WM_LBUTTONDOWN if widgets.owns(msg.hwnd) && widgets.simo_press(msg.hwnd, lparam_point(msg.lParam)) => {}
                 WM_LBUTTONDOWN if widgets.owns(msg.hwnd) => widgets.press(msg.hwnd, lparam_point(msg.lParam), crate::station::select::Keys::of(msg.wParam.0)),
                 WM_LBUTTONUP if widgets.owns(msg.hwnd) => {
                     widgets.release(msg.hwnd, now, false);
@@ -1535,8 +1621,14 @@ impl Controller {
                 WM_MOUSEMOVE if widgets.owns(msg.hwnd) => widgets.hover(msg.hwnd, lparam_point(msg.lParam), panels[0].lang),
                 WM_RBUTTONUP if widgets.owns(msg.hwnd) => {
                     self.end_menu(&mut menu, None, &mut panels, &mut menu_of, &mut widgets, &mut overlay);
-                    // On a thing on the station, its menu; else the widget's.
                     let panel_shown = panels.iter().any(Panel::is_shown);
+                    if let Some(id) = widgets.simo_history_at(msg.hwnd, lparam_point(msg.lParam)) {
+                        menu = crate::ui::simo::history_menu(panels[0].lang, widgets.look_of(msg.hwnd), panel_shown)
+                            .map(|open| (open, MenuFor::SimoHistory(msg.hwnd, id)));
+                        keep_menu_above(&menu, &mut overlay);
+                        continue;
+                    }
+                    // On a thing on the station, its menu; else the widget's.
                     let hit = widgets.hit_at(msg.hwnd, lparam_point(msg.lParam)).map(of_thing);
                     // (On one of several chosen together: their menu.)
                     let together = hit.filter(|hit| matches!(hit, Hit::Shelf(_) | Hit::Copied(_) | Hit::Recent(_))).map_or_else(Vec::new, |hit| crate::station::select::menu_on(msg.hwnd.0 as isize, hit, widgets.page_of(msg.hwnd), widgets.lane_whole(msg.hwnd)));
@@ -1551,6 +1643,20 @@ impl Controller {
                         _ => widgets.menu(msg.hwnd, panels[0].lang, panel_shown).map(|open| (open, MenuFor::Widget(msg.hwnd))),
                     };
                     keep_menu_above(&menu, &mut overlay);
+                }
+                WM_RBUTTONUP if owner.is_some_and(|at| panels[at].part == Part::Simo) => {
+                    let at = owner.unwrap();
+                    let panel = &panels[at];
+                    let hit = panel.simo_local(lparam_point(msg.lParam))
+                        .and_then(|(x, y, size)| crate::ui::simo::history_action(&panel.simo, size, x, y));
+                    if let Some(crate::ui::simo::HistoryAction::Select(id)) = hit {
+                        self.end_menu(&mut menu, None, &mut panels, &mut menu_of, &mut widgets, &mut overlay);
+                        let panel = &panels[at];
+                        menu = crate::ui::simo::history_menu(panel.lang, panel.menu_look(), true)
+                            .map(|open| (open, MenuFor::SimoHistory(panel.window.hwnd, id)));
+                        menu_of = menu.as_ref().map(|_| at);
+                        keep_menu_above(&menu, &mut overlay);
+                    }
                 }
                 // On a thing on the station in the panel, its menu.
                 WM_RBUTTONUP if owner.is_some() => {
@@ -1723,6 +1829,8 @@ impl Controller {
                         self.overlay_chosen(choice, Some(place), &mut panels);
                     }
                 }
+                windows::Win32::UI::Controls::WM_MOUSELEAVE if widgets.simo_leave(msg.hwnd) => {},
+                windows::Win32::UI::Controls::WM_MOUSELEAVE if owner.is_some_and(|at| panels[at].part == Part::Simo) => panels[owner.unwrap()].clear_simo_hover(),
                 WM_MOUSEMOVE if owner.is_some() => panels[owner.unwrap()].hover_at(lparam_point(msg.lParam)),
                 // The wheel over the overlay: its glass clearer (up) or
                 // less clear, a step of the settings' slider a notch.
@@ -1742,6 +1850,24 @@ impl Controller {
                     let (edge, cursor) = pushed_from(msg.wParam, msg.lParam);
                     if let Some(contact) = monitor_at(cursor) {
                         open_pushed((cursor, contact, edge), &mut panels, &mut last_place);
+                    }
+                }
+                SIMO_DROP => {
+                    let drops = std::mem::take(&mut *SIMO_DROPS.lock().unwrap());
+                    for (cursor, edge, paths) in drops {
+                        let Some(contact) = monitor_at(cursor) else { continue };
+                        let configured = crate::screens::id_of(contact.monitor).is_some_and(|id| {
+                            self.config.lock().unwrap().edges.places.part(&id, edge) == Some(Part::Simo)
+                        });
+                        if !configured {
+                            continue;
+                        }
+                        let at = panel_for(&mut panels, self, contact.monitor, edge);
+                        if !panels[at].is_open() {
+                            panels[at].open(cursor, contact, edge, None, true, now);
+                        }
+                        panels[at].simo_files(paths);
+                        last_place = Some((cursor, edge));
                     }
                 }
                 // Their process gone, or come: the edges are watched here while there is none.
@@ -1976,6 +2102,7 @@ fn keep_menu_above(menu: &Option<(crate::ui::menu::Menu, MenuFor)>, overlay: &mu
 enum MenuFor {
     Tray(Vec<usize>),
     Widget(HWND),
+    SimoHistory(HWND, String),
     Overlay,
     /// A thing on the station, by its number, what each row does, and the widget it was opened on (none: the panel).
     Station(u64, Vec<crate::station::Choice>, Option<HWND>),
@@ -2144,6 +2271,17 @@ impl Controller {
             MenuFor::Widget(hwnd) => {
                 if let Some(crate::widget::WidgetChoice::Settings) = choice.and_then(|row| widgets.chose(hwnd, row)) {
                     crate::show_settings(place);
+                }
+            }
+            MenuFor::SimoHistory(hwnd, id) => {
+                if choice == Some(0) {
+                    if let Some(panel) = panels.iter_mut().find(|panel| panel.window.hwnd == hwnd) {
+                        crate::ui::simo::delete_history(&mut panel.simo, &id, hwnd, panel.lang);
+                        if !panel.simo.focused { panel.window.take_keys(false); }
+                        panel.next_frame = Instant::now();
+                    } else {
+                        widgets.delete_simo_history(hwnd, &id, panels[0].lang);
+                    }
                 }
             }
             MenuFor::Overlay => {
@@ -2640,6 +2778,7 @@ impl crate::ui::life::Lives for Panel<'_> {
         self.music.release();
         self.music_layer.release();
         self.music_ground.release();
+        self.simo_ground.release();
         self.turn.release();
         self.behind = None;
         if let Some(scene) = &mut self.backdrop {
@@ -2666,6 +2805,8 @@ struct Panel<'a> {
     layers: PanelLayers,
     /// What plays, drawn whole where the edge it opened from holds it.
     music: crate::ui::music::Music,
+    simo: crate::simo::Chat,
+    simo_return_at: Option<(POINT, Option<(f32, f32)>)>,
     /// The layer what plays is drawn in, anew at each frame, and how many frames it has drawn. (Not straight onto the
     /// surface: text drawn straight onto it comes out a little differently in each place of the compositor's atlas
     /// the frames go to, and shook by a pixel frame by frame; a layer is drawn in its own place and put on whole
@@ -2674,6 +2815,7 @@ struct Panel<'a> {
     music_frames: u64,
     /// The skin's ground under what plays, where it is drawn on the skin (see `prefs::MusicGround`).
     music_ground: render::GroundLayers,
+    simo_ground: render::GroundLayers,
     phase: Phase,
     /// 0 at rest on screen, 1 slid out.
     shift: Transition,
@@ -2763,7 +2905,7 @@ struct Panel<'a> {
     /// corner on the screen, where the hand holds it from that corner, its size, and the one lane it shows, where it
     /// was taken by that lane's head).
     #[allow(clippy::type_complexity)]
-    tear: Option<(Form, f32, POINT, POINT, (f32, f32), Option<String>)>,
+    tear: Option<(Form, f32, POINT, POINT, (f32, f32), Option<String>, Option<crate::simo::Chat>)>,
     /// What plays torn off its lane as it was dragged: the music widget to make (its size, DIPs, its corner on the
     /// screen, and where the hand holds it from that corner). The panel stays.
     tear_music: Option<((f32, f32), POINT, POINT)>,
@@ -2864,6 +3006,7 @@ impl<'a> Panel<'a> {
         // Its window holds its screen (see `Placement::window`): not a program in full screen there, which the shell
         // would make way for (the taskbar hidden).
         unsafe { windows::Win32::UI::WindowsAndMessaging::SetPropW(window.hwnd, windows::core::w!("NonRudeHWND"), Some(windows::Win32::Foundation::HANDLE(1 as _)))? };
+        unsafe { DragAcceptFiles(window.hwnd, true); }
         let surface = Some(Surface::new(&gfx, window.hwnd)?.clipped());
         let mut panel = Panel {
             controller,
@@ -2872,8 +3015,11 @@ impl<'a> Panel<'a> {
             surface,
             layers: PanelLayers::default(),
             music: crate::ui::music::Music::default(),
+            simo: crate::simo::Chat::open(&crate::app().settings.lock().unwrap().simo.clone()),
+            simo_return_at: None,
             music_layer: crate::ui::gfx::Layer::default(),
             music_ground: render::GroundLayers::default(),
+            simo_ground: render::GroundLayers::default(),
             music_frames: 0,
             showing: None,
             phase: Phase::Hidden,
@@ -2994,7 +3140,7 @@ impl<'a> Panel<'a> {
         self.columns = match self.part {
             Part::Workbench => config.workbench_columns,
             Part::Ai => config.ai_columns,
-            Part::Monitor | Part::Music => config.columns,
+            Part::Monitor | Part::Music | Part::Simo => config.columns,
         };
         self.docked = self.part == Part::Ai && config.ai_form == crate::settings::AiForm::Dock;
         // Mid-drag, the size is the drag's; going back to its own size, the way there's.
@@ -3351,6 +3497,11 @@ impl<'a> Panel<'a> {
         // (What it said under what the pointer was on goes with it: a drive's row, the line that switches players.)
         self.hover = None;
         self.unsay();
+        if self.part == Part::Simo {
+            self.clear_simo_hover();
+            self.simo.blur();
+            self.window.take_keys(false);
+        }
         self.recapture = false;
         self.generation += 1;
         self.torn = false;
@@ -3479,13 +3630,14 @@ impl<'a> Panel<'a> {
         }
         // (Giving way to the settings, it is taken all the same: what is behind it is put together from the windows
         // under it, and the settings are in front of it, never among them; see `scene`.)
-        if self.live && self.is_open() && self.capturing.is_none() {
+        let live = self.live && self.part != Part::Simo;
+        if live && self.is_open() && self.capturing.is_none() {
             self.refresh_behind(now);
         }
         // A panel the desktop was taken behind, grown or moved past it
         // (dragged, sized, laid out afresh), takes it again; with live
         // refraction it is taken again anyway.
-        if !self.live && self.drag.is_none() && self.skin.sees_backdrop() {
+        if !live && self.drag.is_none() && self.skin.sees_backdrop() {
             let window = self.placement.as_ref().map(|placement| placement.painted);
             let taken = self.behind.as_ref().map(|behind| behind.capture.rect);
             if let (Some(window), Some(taken)) = (window, taken) {
@@ -3559,6 +3711,8 @@ impl<'a> Panel<'a> {
     /// be, and only the frost follows); the same desktop as before, the
     /// last stands.
     fn collect_behind(&mut self, now: Instant) {
+        // Keep SIMO's glass steady while its caret, messages and buttons repaint.
+        let live = self.live && self.part != Part::Simo;
         let Some(scene) = &mut self.backdrop else { return };
         let Some(capture) = scene.ready() else {
             // Looked for again a while, and none came: what was taken stands, and the scene rests.
@@ -3568,7 +3722,7 @@ impl<'a> Panel<'a> {
                 return;
             }
             // (Live, as often as it is looked at: see `refresh_behind`; each as it comes where they come no oftener.)
-            if self.capturing.is_some() || (self.live && self.behind.as_ref().is_none_or(|behind| scene.paced() || now.duration_since(behind.taken) >= LIVE_INTERVAL)) {
+            if self.capturing.is_some() || (live && self.behind.as_ref().is_none_or(|behind| scene.paced() || now.duration_since(behind.taken) >= LIVE_INTERVAL)) {
                 scene.want();
             }
             return;
@@ -3577,7 +3731,7 @@ impl<'a> Panel<'a> {
         // meanwhile. Not at once: a frame put together while the compositor had put in only some of the windows
         // behind is followed by one with all of them, which is looked for a while (see `widget::LOOK_AGAIN`), and
         // taken in its place if it comes; then it rests.
-        if !self.live {
+        if !live {
             if self.look_again.take().is_some() {
                 scene.rest();
             } else {
@@ -3697,7 +3851,7 @@ impl<'a> Panel<'a> {
     /// on, if it is near them.
     fn edges_at(&self, x: f32, y: f32) -> Edges {
         let (width, height) = match (self.part, &self.opening, &self.placement) {
-            (Part::Music, _, Some(placement)) => ((placement.panel.right - placement.panel.left) as f32 / placement.px, (placement.panel.bottom - placement.panel.top) as f32 / placement.px),
+            (Part::Music | Part::Simo, _, Some(placement)) => ((placement.panel.right - placement.panel.left) as f32 / placement.px, (placement.panel.bottom - placement.panel.top) as f32 / placement.px),
             (_, Some(opening), _) => opening.size,
             _ => return Edges::default(),
         };
@@ -3721,6 +3875,13 @@ impl<'a> Panel<'a> {
             return None;
         }
         let (x, y) = (client.x as f32 / px - self.corner.0, client.y as f32 / px - self.corner.1);
+        if self.part == Part::Simo {
+            let placement = self.placement.as_ref()?;
+            let size = ((placement.panel.right - placement.panel.left) as f32 / px, (placement.panel.bottom - placement.panel.top) as f32 / px);
+            if crate::ui::simo::header_drag_handle(size, x, y) {
+                return Some(Edges::default());
+            }
+        }
         let edges = self.edges_at(x, y);
         if edges.any() {
             return Some(edges);
@@ -3781,6 +3942,7 @@ impl<'a> Panel<'a> {
     /// it is pinned, on its edges it begins to size it, elsewhere (see
     /// `grip_at`) to move it.
     fn press(&mut self, client: POINT, keys: crate::station::select::Keys) {
+        if self.part == Part::Simo && self.simo_press(client) { return; }
         // (Off the panel, in its window before it was told to let clicks through there: nothing of the panel's.)
         if !self.on_panel(client) {
             return;
@@ -3841,7 +4003,13 @@ impl<'a> Panel<'a> {
         } else {
             self.edge_clicks = crate::ui::keys::Clicks::default();
         }
-        let (Some(from), Some(placement)) = (cursor_position(), &self.placement) else { return };
+        let Some(placement) = &self.placement else { return };
+        let from = if self.part == Part::Simo && !edges.any() {
+            POINT { x: placement.window.left + client.x, y: placement.window.top + client.y }
+        } else {
+            let Some(cursor) = cursor_position() else { return };
+            cursor
+        };
         // (Taken in hand going back to its own size: as large as it has come, from there.)
         self.restoring = None;
         let rect = placement.panel;
@@ -3856,6 +4024,200 @@ impl<'a> Panel<'a> {
         }
     }
 
+    fn simo_local(&self, client: POINT) -> Option<(f32, f32, (f32, f32))> {
+        let placement = self.placement.as_ref()?;
+        let size = ((placement.panel.right - placement.panel.left) as f32 / placement.px, (placement.panel.bottom - placement.panel.top) as f32 / placement.px);
+        Some((client.x as f32 / placement.px - self.corner.0, client.y as f32 / placement.px - self.corner.1, size))
+    }
+
+    fn simo_hover(&mut self, client: POINT) {
+        let Some((x, y, size)) = self.simo_local(client) else { return };
+        let shown = self.simo.composer_displayed_text();
+        let attachment = crate::ui::simo::attachment_hover(size, &shown, &self.gfx, self.simo.expanded, self.simo.attachments.len(), x, y);
+        if attachment != self.simo.hovered_attachment {
+            self.simo.hovered_attachment = attachment;
+            self.next_frame = Instant::now();
+        }
+        if self.simo.pointer.replace((x, y)).is_none() {
+            crate::ui::simo::track_leave(self.window.hwnd);
+        }
+        self.next_frame = Instant::now();
+        let action = crate::ui::simo::header_action(size, x, y);
+        self.window.point(crate::ui::simo::pointer_shape(&self.simo, size, &self.gfx, &shown, action.is_some(), x, y));
+        let key = action.map(crate::ui::simo::action_id);
+        if key == self.simo.hovered_action { return; }
+        self.simo.hovered_action = key;
+        match (action, self.placement.as_ref()) {
+            (Some(action), Some(placement)) => {
+                let step = crate::ui::buttons::SIZE + crate::ui::buttons::GAP;
+                let index = match action { crate::ui::simo::Action::Close => 0.0, crate::ui::simo::Action::Pin => 1.0, crate::ui::simo::Action::Settings => 2.0, crate::ui::simo::Action::Expand => 3.0 };
+                let cx = size.0 - 16.0 - crate::ui::buttons::SIZE / 2.0 - index * step;
+                let scale = placement.px;
+                let point = |dx: f32, dy: f32| (placement.window.left as f32 + (self.corner.0 + dx) * scale, placement.window.top as f32 + (self.corner.1 + dy) * scale);
+                let ((left, top), (right, bottom)) = (point(cx - 14.0, 2.0), point(cx + 14.0, 30.0));
+                let words = crate::ui::simo::action_label(action, self.simo.expanded, self.pinned, self.lang);
+                crate::ui::tip::show(self.window.hwnd, words, RECT { left: left.round() as i32, top: top.round() as i32, right: right.round() as i32, bottom: bottom.round() as i32 }, self.theme.dark);
+            }
+            _ => crate::ui::tip::hide(),
+        }
+    }
+
+    fn clear_simo_hover(&mut self) {
+        self.simo.hovered_attachment = None;
+        if self.simo.hovered_action.take().is_some() { crate::ui::tip::hide(); }
+        if self.simo.pointer.take().is_some() { self.next_frame = Instant::now(); }
+    }
+
+    fn simo_press(&mut self, client: POINT) -> bool {
+        let Some((x, y, size)) = self.simo_local(client) else { return false };
+        if let Some(action) = crate::ui::simo::header_action(size, x, y) {
+            match action {
+                crate::ui::simo::Action::Close => self.dismiss(),
+                crate::ui::simo::Action::Pin => {
+                    self.pinned ^= true;
+                    self.simo.pinned = self.pinned;
+                    if self.floating() { crate::app().place_panel(self.kept_at()); }
+                    else if let Some(placement) = &self.placement { crate::app().pin_panel((placement.anchor.x, placement.anchor.y), self.edge, self.pinned); }
+                }
+                crate::ui::simo::Action::Settings => {
+                    self.settings_from = self.placement.as_ref().map(|placement| placement.panel);
+                    crate::show_settings(self.settings_from);
+                }
+                crate::ui::simo::Action::Expand => {
+                    if let Some(placement) = self.placement.as_mut() {
+                        if self.simo.expanded {
+                            if let Some((anchor, floating)) = self.simo_return_at.take() {
+                                placement.anchor = anchor;
+                                placement.floating = floating;
+                            }
+                        } else {
+                            self.simo_return_at = Some((placement.anchor, placement.floating));
+                        }
+                    }
+                    self.simo.expanded = !self.simo.expanded;
+                    self.simo.edit_rect = None;
+                    self.simo.reply_hits.clear();
+                    self.arrange();
+                    if self.simo.focused { self.place_simo_ime(); }
+                }
+            }
+            self.next_frame = Instant::now();
+            return true;
+        }
+        if let Some(action) = crate::ui::simo::history_action(&self.simo, size, x, y) {
+            match action {
+                crate::ui::simo::HistoryAction::New => { self.simo.new_conversation(); self.simo.history_page = 0; }
+                crate::ui::simo::HistoryAction::Select(id) => { self.simo.select_conversation(&id); self.simo.history_page = 0; }
+                crate::ui::simo::HistoryAction::Previous => self.simo.history_page = self.simo.history_page.saturating_sub(1),
+                crate::ui::simo::HistoryAction::Next => self.simo.history_page += 1,
+            }
+            self.next_frame = Instant::now();
+            return true;
+        }
+        if crate::ui::simo::press_editor(&mut self.simo, &self.gfx, &self.window, x, y)
+            || crate::ui::simo::press_reply(&mut self.simo, self.window.hwnd, x, y)
+        {
+            if self.simo.editing_focused && self.simo.focused {
+                self.place_simo_ime();
+            } else if !self.simo.focused {
+                self.window.take_keys(false);
+            }
+            self.next_frame = Instant::now();
+            return true;
+        }
+        let shown = self.simo.composer_displayed_text();
+        if let Some(index) = crate::ui::simo::attachment_remove_at(size, &shown, &self.gfx, self.simo.expanded, self.simo.attachments.len(), x, y) {
+            self.simo.attachments.remove(index);
+            self.simo.hovered_attachment = None;
+            self.next_frame = Instant::now();
+            return true;
+        }
+        if let Some(action) = crate::ui::simo::input_action(size, &shown, &self.gfx, self.simo.expanded, self.simo.attachments.len(), x, y) {
+            if action == crate::ui::simo::InputAction::Send {
+                let settings = crate::app().settings.lock().unwrap().simo.clone();
+                self.simo.send(settings);
+            } else {
+                self.simo.focus_editor(false);
+                self.window.take_simo_keys();
+                if action == crate::ui::simo::InputAction::Text {
+                    crate::ui::simo::select_draft(&mut self.simo, size, &self.gfx, self.window.hwnd, x, y);
+                }
+                self.place_simo_ime();
+            }
+            if action == crate::ui::simo::InputAction::Attach {
+                for path in crate::simo::choose_files(self.window.hwnd) {
+                    if let Ok(attachment) = crate::simo::Attachment::from_path(&path) {
+                        self.simo.attachments.push(attachment);
+                    }
+                }
+            }
+            self.next_frame = Instant::now();
+            return true;
+        }
+        if crate::ui::simo::header_drag_handle(size, x, y) {
+            return false;
+        }
+        if x >= 0.0 && x < size.0 && y >= 0.0 && y < size.1 {
+            self.simo.blur();
+            self.window.take_keys(false);
+            self.next_frame = Instant::now();
+            return true;
+        }
+        self.simo.blur();
+        self.window.take_keys(false);
+        false
+    }
+
+    fn simo_files(&mut self, paths: Vec<std::path::PathBuf>) {
+        let mut added = false;
+        for path in paths {
+            if let Ok(attachment) = crate::simo::Attachment::from_path(&path) {
+                self.simo.attachments.push(attachment);
+                added = true;
+            }
+        }
+        if added {
+            self.simo.focus();
+            self.window.take_simo_keys();
+            self.place_simo_ime();
+        }
+        self.next_frame = Instant::now();
+    }
+    fn simo_key(&mut self, message: u32, value: u16) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SHIFT};
+        use windows::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN};
+        if !self.simo.focused { return; }
+        match message {
+            WM_CHAR if value >= 0x20 && value != 0x7F => self.simo.type_utf16(value),
+            WM_CHAR => return,
+            WM_KEYDOWN => match VIRTUAL_KEY(value) {
+                VK_ESCAPE if self.simo.editing_focused => self.simo.cancel_edit(),
+                VK_ESCAPE => self.simo.blur(),
+                VK_RETURN if !self.simo.composition.is_empty() => {}
+                VK_RETURN if unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 => self.simo.insert_text("\n"),
+                VK_RETURN => {
+                    let settings = crate::app().settings.lock().unwrap().simo.clone();
+                    if self.simo.editing_focused { self.simo.send_edit(settings); }
+                    else { self.simo.send(settings); }
+                }
+                _ if crate::ui::simo::edit_input(&mut self.simo, self.window.hwnd, message, value) => {}
+                _ => return,
+            },
+            _ => return,
+        }
+        if self.simo.focused {
+            self.place_simo_ime();
+        } else {
+            self.window.take_keys(false);
+        }
+        self.next_frame = Instant::now();
+    }
+
+    fn place_simo_ime(&self) {
+        let Some(placement) = &self.placement else { return };
+        let size = ((placement.panel.right - placement.panel.left) as f32 / placement.px, (placement.panel.bottom - placement.panel.top) as f32 / placement.px);
+        crate::ui::simo::place_ime(self.window.hwnd, size, &self.simo, &self.gfx, placement.px, ((self.corner.0 * placement.px).round() as i32, (self.corner.1 * placement.px).round() as i32));
+    }
     /// The pointer taken, and followed wherever it goes while it is: the panel is never in front, and a window not in
     /// front is told of the pointer only over itself, its capture or not. (A note pressed could not be pulled off it:
     /// the pointer, past the panel's edge, was no longer heard of, but where something of Glance's in front had
@@ -4023,7 +4385,8 @@ impl<'a> Panel<'a> {
             }
             // Not moved yet: only once the pointer has gone far enough.
             let from = MOVE_FROM * placement.contact.scale;
-            if placement.held.is_none() && ((dx * dx + dy * dy) as f32) < from * from {
+            let started = if self.part == Part::Simo { dx != 0 || dy != 0 } else { (dx as f32).hypot(dy as f32) >= from };
+            if placement.held.is_none() && !started {
                 return;
             }
             // Pulled far enough: a widget torn off, the panel as it shows,
@@ -4031,7 +4394,7 @@ impl<'a> Panel<'a> {
             // widget is drawn, so that one is on the screen throughout.
             // (Unless that is turned off: then pulling it does nothing.)
             let _ = held;
-            if !self.controller.config.lock().unwrap().tear_off {
+            if self.part != Part::Simo && !self.controller.config.lock().unwrap().tear_off {
                 return;
             }
             // What plays, torn off whole: a music widget as large as the panel, under the hand where it was taken.
@@ -4040,6 +4403,15 @@ impl<'a> Panel<'a> {
                 let size = ((placement.panel.right - placement.panel.left) as f32 / scale, (placement.panel.bottom - placement.panel.top) as f32 / scale);
                 let at = POINT { x: placement.panel.left + dx, y: placement.panel.top + dy };
                 self.tear_music = Some((size, at, POINT { x: cursor.x - at.x, y: cursor.y - at.y }));
+                self.end_drag();
+                self.torn = true;
+                return;
+            }
+            if self.part == Part::Simo {
+                let at = POINT { x: placement.panel.left + dx, y: placement.panel.top + dy };
+                let size = ((placement.panel.right - placement.panel.left) as f32 / placement.contact.scale, (placement.panel.bottom - placement.panel.top) as f32 / placement.contact.scale);
+                let chat = std::mem::take(&mut self.simo);
+                self.tear = Some((Form::Lanes { detail: Detail::Full, columns: 1 }, 1.0, at, POINT { x: cursor.x - at.x, y: cursor.y - at.y }, size, None, Some(chat)));
                 self.end_drag();
                 self.torn = true;
                 return;
@@ -4058,12 +4430,12 @@ impl<'a> Panel<'a> {
                 None => (opening.choice.map_or(Form::Lanes { detail: Detail::Full, columns: opening.layout.columns }, |choice| choice.form), POINT { x: placement.panel.left + dx, y: placement.panel.top + dy }, None),
             };
             let size = ((placement.panel.right - placement.panel.left) as f32 / placement.contact.scale, (placement.panel.bottom - placement.panel.top) as f32 / placement.contact.scale);
-            self.tear = Some((form, opening.zoom, at, POINT { x: cursor.x - at.x, y: cursor.y - at.y }, size, only));
+            self.tear = Some((form, opening.zoom, at, POINT { x: cursor.x - at.x, y: cursor.y - at.y }, size, only, None));
             self.end_drag();
             self.torn = true;
             return;
         }
-        if self.part == Part::Music {
+        if self.part == Part::Music || self.part == Part::Simo {
             self.size_music(drag, (dx, dy), now);
             return;
         }
@@ -4362,7 +4734,21 @@ impl<'a> Panel<'a> {
             Part::Monitor | Part::Workbench | Part::Ai => {
                 self.arrange_lanes();
             }
+            Part::Simo => {
+                self.simo_size();
+            }
         }
+    }
+
+    fn simo_size(&mut self) -> (f32, f32) {
+        let size = if self.simo.expanded { (940.0, 760.0) } else { (crate::ui::simo::WIDTH, crate::ui::simo::HEIGHT) };
+        let contact = self.placement.as_ref().map(|placement| placement.contact).unwrap_or(Contact { monitor: RECT::default(), work: RECT::default(), scale: 1.0 });
+        let most = ((contact.work.right - contact.work.left) as f32 / contact.scale - 2.0 * GAP, (contact.work.bottom - contact.work.top) as f32 / contact.scale - 2.0 * GAP);
+        let size = (size.0.min(most.0.max(180.0)), size.1.min(most.1.max(220.0)));
+        if let Some(placement) = &mut self.placement {
+            place(placement, self.edge, &self.theme, size, 1.0, None);
+        }
+        size
     }
 
     /// What plays, as large as it is shown from the edge the panel is at (as a card from a side, as a player across
@@ -4558,6 +4944,10 @@ impl<'a> Panel<'a> {
             if whole > SLOW_FRAME {
                 crate::widget::note_sparingly("panel frame", || format!("panel: a frame of what plays took {:.1} ms", whole.as_secs_f32() * 1000.0));
             }
+            return;
+        }
+        if self.part == Part::Simo {
+            self.frame_simo(now);
             return;
         }
         self.step_restore(now, false);
@@ -4961,6 +5351,64 @@ impl<'a> Panel<'a> {
         self.next_frame = if moving { now } else { now + Duration::from_millis(250) };
     }
 
+    fn frame_simo(&mut self, now: Instant) {
+        self.hits.clear();
+        self.hover = None;
+        self.unsay();
+        self.simo.pinned = self.pinned;
+        let size = self.simo_size();
+        let Some(placement) = self.placement.as_ref() else { return };
+        let px = placement.px;
+        let window = placement.painted;
+        let surface_size = ((window.right - window.left) as u32, (window.bottom - window.top) as u32);
+        let offset = (window.left - placement.window.left, window.top - placement.window.top);
+        let rest = ((placement.panel.left - window.left) as f32 / px, (placement.panel.top - window.top) as f32 / px);
+        let (shift, opacity) = (self.shift.value(now), self.opacity.value(now));
+        let travel = if self.edge == Edge::Top { size.1 } else { size.0 } + self.theme.margin;
+        let (mut x, mut y) = rest;
+        match self.edge {
+            Edge::Left => x -= shift * travel,
+            Edge::Right => x += shift * travel,
+            Edge::Top => y -= shift * travel,
+        }
+        // SIMO is drawn inside the screen-sized panel window at this offset.
+        // Keep hit testing in the same coordinate space; otherwise clicks on
+        // the visible chat input can be mistaken for panel drags.
+        self.corner = (x + offset.0 as f32 / px, y + offset.1 as f32 / px);
+        let theme = &self.theme;
+        let chat = &mut self.simo;
+        let frost = self.frost;
+        let behind = &mut self.behind;
+        let simo_ground = &mut self.simo_ground;
+        let surface = self.surface.as_mut().unwrap();
+        surface.offset(offset);
+        let drawn = surface.draw(&self.gfx, surface_size, px, |frame| {
+            if opacity < 1.0 {
+                let everything = D2D_RECT_F { left: -f32::MAX, top: -f32::MAX, right: f32::MAX, bottom: f32::MAX };
+                unsafe { frame.dc.PushLayer(&D2D1_LAYER_PARAMETERS1 { contentBounds: everything, opacity, ..Default::default() }, None) };
+            }
+            if theme.skin.sees_backdrop() {
+                let backdrop = behind.as_mut().and_then(|behind| behind.backdrop(&frame.dc, px, window, rest));
+                if let Err(error) = simo_ground.draw_whole(frame, theme, size, backdrop, frost, false, Matrix3x2::translation(x, y), px) {
+                    crate::journal::note(format!("panel: SIMO glass ground not drawn: {error}"));
+                    frame.fail(error);
+                }
+            }
+            frame.origin(x, y);
+            crate::ui::simo::paint_frosted_panel(frame, theme, chat, size, now);
+            frame.origin(0.0, 0.0);
+            if opacity < 1.0 { unsafe { frame.dc.PopLayer() } };
+        });
+        if let Err(error) = drawn {
+            gfx::failed("simo panel", &self.gfx, Some(&error));
+            self.next_frame = now + DEVICE_RETRY;
+            return;
+        }
+        self.gfx.sweep();
+        let animating = !self.shift.done(now) || !self.opacity.done(now);
+        self.next_frame = if animating || self.simo.requesting() || self.simo.focused || crate::ui::simo::scrolling(&self.simo) { now + Duration::from_millis(16) } else { now + Duration::from_millis(100) };
+    }
+
     /// Whether the settings, open, were asked from its settings' button (it shows so, lit, and they pour back into it).
     fn settings_here(&self) -> bool {
         let from = settings_window::asked_from();
@@ -5134,7 +5582,12 @@ impl<'a> Panel<'a> {
         // Off the panel (its window holds its screen): clicks there are let through at once, not as the pointer is
         // next followed (see `track`), which a quick click comes before.
         if !self.held() && !self.on_panel(client) {
+            if self.part == Part::Simo { self.clear_simo_hover(); }
             self.window.set_click_through(true);
+            return;
+        }
+        if self.part == Part::Simo {
+            self.simo_hover(client);
             return;
         }
         // Unpinned, its edges and its bar show what a drag there does (the
@@ -5174,6 +5627,7 @@ impl<'a> Panel<'a> {
     }
 
     fn click(&mut self, client: POINT) {
+        if self.part == Part::Simo { return; }
         self.next_frame = Instant::now();
         let hit = self.hit_at(client);
         let pressed = self.shelf_press.take();
@@ -5275,6 +5729,14 @@ impl<'a> Panel<'a> {
             return;
         }
         let client = POINT { x: screen.x - window.left, y: screen.y - window.top };
+        if self.part == Part::Simo {
+            if let Some((x, y, _)) = self.simo_local(client) {
+                if crate::ui::simo::scroll_at(&mut self.simo, x, y, delta) {
+                    self.next_frame = Instant::now();
+                }
+            }
+            return;
+        }
         let under: Vec<Hit> = self.hits_at(client).collect();
         if view::wheel(&mut self.scrolls, &under, delta, false) {
             self.next_frame = Instant::now();

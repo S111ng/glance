@@ -73,13 +73,11 @@ fn wanted() -> Vec<Wanted> {
         let settings = crate::app().settings.lock().unwrap();
         (settings.places().clone(), crate::ui::prefs::module_on_in(&settings.view, "workbench", "station"))
     };
-    if !station {
-        return wanted;
-    }
     for monitor in crate::screens::monitors() {
         let Some(id) = crate::screens::id_of(monitor) else { continue };
         for edge in [Edge::Left, Edge::Right, Edge::Top] {
-            if places.part(&id, edge) != Some(Part::Workbench) {
+            let Some(part) = places.part(&id, edge) else { continue };
+            if part != Part::Simo && (part != Part::Workbench || !station) {
                 continue;
             }
             let strip = match edge {
@@ -87,7 +85,8 @@ fn wanted() -> Vec<Wanted> {
                 Edge::Right => RECT { left: monitor.right - STRIP, ..monitor },
                 Edge::Top => RECT { bottom: monitor.top + STRIP, ..monitor },
             };
-            wanted.push((strip, vec![strip], Some(edge), Lands::Station, None));
+            let lands = if part == Part::Simo { Lands::Simo(edge) } else { Lands::Station };
+            wanted.push((strip, vec![strip], Some(edge), lands, None));
         }
     }
     wanted
@@ -250,7 +249,19 @@ fn make(rect: RECT, parts: Vec<RECT>, edge: Option<Edge>, lands: Lands, over: Op
         }
         let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(window, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-        let told = move |dragged: Dragged| super::run::caught(dragged, edge, lands, over);
+        let last_point = std::cell::Cell::new(windows::Win32::Foundation::POINT::default());
+        let told = move |dragged: Dragged| match dragged {
+            Dragged::Over(at) => {
+                last_point.set(at);
+                super::run::caught(Dragged::Over(at), edge, lands, over);
+            }
+            dropped if matches!(lands, Lands::Simo(_)) => {
+                if let Lands::Simo(edge) = lands {
+                    super::run::caught_simo(last_point.get(), edge, dropped);
+                }
+            }
+            other => super::run::caught(other, edge, lands, over),
+        };
         // (What is kept at hand may be given a file off the station; the station, none of its own again; a page other
         // than the station's, nothing, only told it comes; a device nearby, what is dragged off the station, sent.)
         let target = match lands {

@@ -50,6 +50,8 @@ pub mod settings_window;
 #[cfg(windows)]
 pub mod skins;
 pub mod smoke;
+#[cfg(windows)]
+pub mod simo;
 pub mod text;
 pub mod theme;
 pub mod todo;

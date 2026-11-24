@@ -1103,6 +1103,7 @@ enum Page {
     Music,
     /// The AI component: what AI tools spent and what is left of their limits.
     Ai,
+    Simo,
     /// The devices this PC knows: the phones paired with it and the devices it takes files from without asking, and
     /// those found nearby; this PC's name to them.
     Devices,
@@ -1142,7 +1143,7 @@ enum NavItem {
     Components,
 }
 
-const NAV_ITEMS: [NavItem; 11] = [
+const NAV_ITEMS: [NavItem; 12] = [
     NavItem::Page(Page::Layout),
     NavItem::Page(Page::Look),
     NavItem::Components,
@@ -1150,6 +1151,7 @@ const NAV_ITEMS: [NavItem; 11] = [
     NavItem::Page(Page::Workbench),
     NavItem::Page(Page::Music),
     NavItem::Page(Page::Ai),
+    NavItem::Page(Page::Simo),
     NavItem::Page(Page::Devices),
     NavItem::Page(Page::Phone),
     NavItem::Page(Page::Nearby),
@@ -1166,6 +1168,7 @@ impl NavItem {
             NavItem::Page(Page::Workbench) => pick(lang, "工作台", "Workbench"),
             NavItem::Page(Page::Music) => pick(lang, "音乐", "Music"),
             NavItem::Page(Page::Ai) => pick(lang, "AI 用量", "AI usage"),
+            NavItem::Page(Page::Simo) => "SIMO",
             NavItem::Page(Page::Devices) => pick(lang, "设备", "Devices"),
             NavItem::Page(Page::Phone) => pick(lang, "手机遥控", "Phone remote"),
             NavItem::Page(Page::Nearby) => pick(lang, "附近传输", "Nearby sharing"),
@@ -1184,6 +1187,7 @@ impl Page {
             Page::Workbench => Icon::PencilRuler,
             Page::Music => Icon::Music,
             Page::Ai => Icon::Ai,
+            Page::Simo => Icon::MessageCircle,
             Page::Devices => Icon::MonitorSmartphone,
             Page::Phone => Icon::Smartphone,
             Page::Nearby => Icon::Share,
@@ -1418,6 +1422,7 @@ fn thread_talk(lang: Lang, dark: bool) -> super::ask::thread::Talk<'static> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Switch {
     Live,
+    RunningWindows,
     /// Whether pulling the panel off its edge tears it off as a widget.
     TearOff,
     Startup,
@@ -1436,6 +1441,18 @@ enum Switch {
     /// Nearby transfer, and whether it shows at the screen's edge (see `Settings::nearby_notice`).
     Nearby,
     NearbyNotice,
+    SimoEnabled,
+    SimoVoice,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum SimoField {
+    ApiBaseUrl,
+    ApiKey,
+    Model,
+    TtsBaseUrl,
+    TtsModel,
+    TtsVoice,
 }
 
 /// The remote's switches, the lights' program fetched (`lights`) or not, on a laptop or not: the lights set, the
@@ -1497,6 +1514,7 @@ enum Named {
     Key(String, usize),
     /// Words to send to devices nearby (see `send`): on lines of their own, kept till added or left.
     Words,
+    Simo(SimoField),
 }
 
 /// Something being named in its row (see `Named`): the words written, since when its caret blinks, whether the input
@@ -1526,7 +1544,7 @@ const KEY_TALLER: f32 = 24.0;
 impl Renaming {
     /// Whether what is written is not shown: a key's.
     fn masked(&self) -> bool {
-        matches!(self.of, Named::Key(..))
+        matches!(self.of, Named::Key(..) | Named::Simo(SimoField::ApiKey))
     }
 
     /// How far across what is written its `at`th unit is, in `font`: its characters' width, or a key's dots'.
@@ -1641,6 +1659,10 @@ enum Target {
     Manage,
     /// The box this PC's name is written in: pressed, it is written there.
     PcName,
+    SimoField(SimoField),
+    SimoRefresh,
+    SimoStorage,
+    SimoModels,
     /// Trusts the device of that certificate's fingerprint no longer (its files asked about again).
     Untrust(String),
     /// Opens where what comes from devices nearby goes: the folder chosen for it, else the station's.
@@ -1767,6 +1789,9 @@ enum Row {
     /// for each, by its path.
     AddFolder,
     Folder(String),
+    SimoField(SimoField),
+    SimoRefresh,
+    SimoStorage,
 }
 
 impl Row {
@@ -2080,6 +2105,9 @@ struct Ui {
     /// Physical pixels per DIP.
     scale: f32,
     settings: Settings,
+    simo_loading: Option<std::thread::JoinHandle<Result<Vec<String>, String>>>,
+    simo_result: Option<Result<(), String>>,
+    simo_menu: bool,
     /// The settings as this window last took them: what it changed since
     /// is where `settings` differs.
     base: Settings,
@@ -2211,6 +2239,8 @@ struct Ui {
     choosing_folders: Option<(ChoosingFor, std::thread::JoinHandle<Vec<std::path::PathBuf>>)>,
     /// The same, for the folder what devices nearby send goes to.
     choosing_kept: Option<std::thread::JoinHandle<Vec<std::path::PathBuf>>>,
+    /// Windows' chooser for SIMO's local conversations and attachments.
+    choosing_simo_storage: Option<std::thread::JoinHandle<Vec<std::path::PathBuf>>>,
     /// A menu up (where what devices nearby send goes, or a module's choices: see `in_menu`), run by this window's thread
     /// (see `menu_message`), and what it is of.
     menu: Option<super::menu::Menu>,
@@ -2462,6 +2492,9 @@ fn make(gfx: Rc<Gfx>, shown: Option<Option<RECT>>, to: Option<To>) -> Option<HWN
             palette: Palette::new(false),
             base: taken(&settings, &prefs),
             settings,
+            simo_loading: None,
+            simo_result: None,
+            simo_menu: false,
             prefs,
             page: Page::Layout,
             tab: Tab::Shown,
@@ -2515,6 +2548,7 @@ fn make(gfx: Rc<Gfx>, shown: Option<Option<RECT>>, to: Option<To>) -> Option<HWN
             drives_at: None,
             choosing_folders: None,
             choosing_kept: None,
+            choosing_simo_storage: None,
             menu: None,
             menu_of: MenuOf::KeptIn,
             send: send::Pane::default(),
@@ -2759,7 +2793,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lp
         }
         // (Measuring: a page, and a tab of the monitor's, turned to as a press on it turns to it; see `perf`.)
         PERF_TURN if crate::perf::on() => {
-            const PAGES: [Page; 10] = [Page::Layout, Page::Look, Page::Monitor, Page::Workbench, Page::Music, Page::Ai, Page::Devices, Page::Phone, Page::Nearby, Page::General];
+            const PAGES: [Page; 11] = [Page::Layout, Page::Look, Page::Monitor, Page::Workbench, Page::Music, Page::Ai, Page::Simo, Page::Devices, Page::Phone, Page::Nearby, Page::General];
             const TABS: [Tab; 3] = [Tab::Shown, Tab::Data, Tab::Overlay];
             with_ui(|ui| {
                 crate::perf::mark(|| format!("settings turn {} {}", wparam.0, lparam.0));
@@ -3133,6 +3167,7 @@ impl Ui {
             }
             (Page::Workbench, _) => {
                 rows.push(Row::Choice(Field::Columns));
+                rows.push(Row::Switch(Switch::RunningWindows));
                 for entry in &self.prefs.workbench {
                     let id = format!("{WORKBENCH}{}", entry.id);
                     rows.push(Row::Module(id.clone()));
@@ -3180,6 +3215,23 @@ impl Ui {
                     "在线查找歌词时，会将歌名发送至网易云音乐、QQ 音乐、酷狗或 LRCLIB。本地歌曲优先使用文件内嵌的歌词。同步歌词需要播放器提供播放进度。",
                     "To find lyrics online, the track's title is sent to NetEase Cloud Music, QQ Music, Kugou or LRCLIB. A local track uses the lyrics in its file first. Synced lyrics need the player to report its position.",
                 )));
+            }
+            (Page::Simo, _) => {
+                rows.extend([
+                    Row::Switch(Switch::SimoEnabled),
+                    Row::Group(pick(self.lang, "服务接口", "Provider")),
+                    Row::SimoField(SimoField::ApiBaseUrl),
+                    Row::SimoField(SimoField::ApiKey),
+                    Row::SimoRefresh,
+                    Row::SimoField(SimoField::Model),
+                    Row::Group(pick(self.lang, "本机数据", "Local data")),
+                    Row::SimoStorage,
+                    Row::Group(pick(self.lang, "语音输出", "Voice output")),
+                    Row::Switch(Switch::SimoVoice),
+                    Row::SimoField(SimoField::TtsBaseUrl),
+                    Row::SimoField(SimoField::TtsModel),
+                    Row::SimoField(SimoField::TtsVoice),
+                ]);
             }
             (Page::Devices, _) => self.device_rows(&mut rows),
             (Page::Phone, _) => self.remote_rows(&mut rows),
@@ -3506,6 +3558,9 @@ impl Ui {
             self.scroll_target = 0.0;
             self.drag = None;
             self.raise_more();
+            if page == Page::Simo && self.settings.simo.models.is_empty() && self.simo_result.is_none() {
+                self.refresh_simo();
+            }
         }
         self.next_frame = Instant::now();
     }
@@ -3756,6 +3811,14 @@ impl Ui {
     fn end_menu(&mut self, choice: Option<usize>) {
         let Some(menu) = self.menu.take() else { return };
         menu.close();
+        if std::mem::take(&mut self.simo_menu) {
+            if let Some(model) = choice.and_then(|index| self.settings.simo.models.get(index)) {
+                self.settings.simo.model = model.clone();
+                self.save();
+            }
+            self.next_frame = Instant::now();
+            return;
+        }
         self.menu_chosen(self.menu_of, choice);
         self.next_frame = Instant::now();
     }
@@ -4317,6 +4380,15 @@ impl Ui {
                 },
                 vec![(if self.choosing_folders.is_some() { p("选择中", "Choosing") } else { p("添加文件夹", "Add folders") }, Target::AddFolder, if self.may_add_folder() { Button::Plain } else { Button::Quiet })],
             ),
+            Row::SimoStorage => {
+                let path = crate::simo::storage_dir(&self.settings.simo);
+                let detail = match lang {
+                    Lang::Zh => format!("会话历史、图片和文档保存在 {}", path.display()),
+                    Lang::En => format!("Conversation history, images and documents are saved in {}", path.display()),
+                };
+                let choosing = self.choosing_simo_storage.is_some();
+                (p("SIMO 存储位置", "SIMO storage location"), detail, vec![(if choosing { p("选择中", "Choosing") } else { p("选择文件夹", "Choose folder") }, Target::SimoStorage, if choosing { Button::Quiet } else { Button::Plain })])
+            }
             Row::Guide => (
                 p("使用引导", "Guide"),
                 p("再次查看如何呼出面板、调整布局与使用快捷键", "Shows again how to open panels, arrange them and use the shortcuts"),
@@ -4329,6 +4401,65 @@ impl Ui {
             ),
             _ => return None,
         })
+    }
+
+    fn simo_field_words(&self, field: SimoField) -> (&'static str, String) {
+        let value = match field {
+            SimoField::ApiBaseUrl => self.settings.simo.api_base_url.clone(),
+            SimoField::ApiKey => self.settings.simo.api_key.chars().map(|_| '*').collect(),
+            SimoField::Model => if self.settings.simo.model.is_empty() { pick(self.lang, "未选择", "Not selected").into() } else { self.settings.simo.model.clone() },
+            SimoField::TtsBaseUrl => self.settings.simo.tts_base_url.clone(),
+            SimoField::TtsModel => self.settings.simo.tts_model.clone(),
+            SimoField::TtsVoice => self.settings.simo.tts_voice.clone(),
+        };
+        let name = match field {
+            SimoField::ApiBaseUrl => pick(self.lang, "API Base URL", "API Base URL"),
+            SimoField::ApiKey => pick(self.lang, "API Key", "API Key"),
+            SimoField::Model => pick(self.lang, "模型", "Model"),
+            SimoField::TtsBaseUrl => pick(self.lang, "TTS Base URL", "TTS Base URL"),
+            SimoField::TtsModel => pick(self.lang, "TTS 模型", "TTS model"),
+            SimoField::TtsVoice => pick(self.lang, "TTS 音色", "TTS voice"),
+        };
+        (name, value)
+    }
+
+    fn refresh_simo(&mut self) {
+        if self.simo_loading.is_some() || self.settings.simo.api_key.is_empty() {
+            return;
+        }
+        let base = self.settings.simo.api_base_url.clone();
+        let key = self.settings.simo.api_key.clone();
+        self.simo_loading = Some(std::thread::spawn(move || crate::simo::fetch_models(&base, &key)));
+        self.next_frame = Instant::now();
+    }
+
+    fn poll_simo(&mut self, now: Instant) {
+        let Some(worker) = &self.simo_loading else { return };
+        if !worker.is_finished() {
+            self.next_frame = self.next_frame.min(now + Duration::from_millis(100));
+            return;
+        }
+        let result = self.simo_loading.take().unwrap().join().unwrap_or_else(|_| Err("Model loading failed".into()));
+        self.simo_result = Some(result.map(|models| {
+            self.settings.simo.models = models;
+            if !self.settings.simo.models.contains(&self.settings.simo.model) {
+                self.settings.simo.model.clear();
+            }
+            self.save();
+        }));
+    }
+
+    fn open_simo_models(&mut self) {
+        if self.menu.is_some() || self.settings.simo.models.is_empty() {
+            return;
+        }
+        let Some((rect, _)) = self.targets.iter().find(|(_, target)| *target == Target::SimoModels) else { return };
+        let mut at = POINT { x: (rect.x * self.scale).round() as i32, y: ((rect.y + rect.h + 4.0) * self.scale).round() as i32 };
+        unsafe { let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut at); }
+        let items = self.settings.simo.models.iter().map(|model| super::menu::Item::new(model.clone(), None, *model == self.settings.simo.model, false)).collect();
+        let look = super::menu::Look { skin: None, dark: self.dark, frost: 1.0, zoom: 1.0 };
+        self.menu = super::menu::Menu::open_at(items, look, at, false, false);
+        self.simo_menu = self.menu.is_some();
     }
 
     /// How open module `id`'s card is: 0 closed, 1 open, between while it
@@ -4632,6 +4763,27 @@ impl Ui {
                 self.send.add_words(written);
                 return;
             }
+            Named::Simo(field) => {
+                let value = written.trim().to_string();
+                match field {
+                    SimoField::ApiBaseUrl => self.settings.simo.api_base_url = value,
+                    SimoField::ApiKey => self.settings.simo.api_key = value,
+                    SimoField::Model => self.settings.simo.model = value,
+                    SimoField::TtsBaseUrl => self.settings.simo.tts_base_url = value,
+                    SimoField::TtsModel => self.settings.simo.tts_model = value,
+                    SimoField::TtsVoice => self.settings.simo.tts_voice = value,
+                }
+                self.save();
+                if matches!(field, SimoField::ApiBaseUrl | SimoField::ApiKey) {
+                    self.settings.simo.models.clear();
+                    self.settings.simo.model.clear();
+                    self.simo_loading = None;
+                    self.simo_result = None;
+                    self.save();
+                    self.refresh_simo();
+                }
+                return;
+            }
             Named::Sensor(_, name) => name,
         };
         let Some((group, sensor)) = sensor_of(&name) else { return };
@@ -4681,7 +4833,7 @@ impl Ui {
                     // (A key written is not copied out.)
                     VK_C | VK_X if ctrl && !masked => {
                         let selection = typing.selection();
-                        if !selection.is_empty() {
+                        if !selection.is_empty() && renaming.of != Named::Simo(SimoField::ApiKey) {
                             let text = String::from_utf16_lossy(&typing.text[selection]);
                             if crate::clipboard::put(hwnd, &[(crate::clipboard::TEXT, crate::clipboard::utf16_z(&text))]) && key == VK_X {
                                 typing.put(&[]);
@@ -4962,6 +5114,11 @@ impl Ui {
                 Some(p("按住面板拖离屏幕边缘，即可将其放在桌面上", "Drag the panel away from the screen's edge to keep it on the desktop")),
                 self.settings.tear_off,
             ),
+            Switch::RunningWindows => (
+                p("显示运行中的应用", "Show running apps"),
+                Some(p("窗口和托盘共用一个图标，点击可切换到应用", "Show one icon per app across open windows and the notification area")),
+                self.settings.station.running_windows,
+            ),
             // Only a copy no ordinary program can replace (one the installer
             // put in Program Files) may start elevated unasked.
             Switch::Startup => (
@@ -5034,6 +5191,8 @@ impl Ui {
                 Some(p("有设备请求发送、正在接收和收到文件时，在工作台所在的屏幕边缘提示", "When a device asks to send, while its files come and once they have, at the edge of the screen the workbench is on")),
                 self.settings.nearby_notice,
             ),
+            Switch::SimoEnabled => (p("启用 SIMO", "Enable SIMO"), Some(p("启用后可将 SIMO 放到任意屏幕边缘", "Enable SIMO on any screen edge")), self.settings.simo.enabled),
+            Switch::SimoVoice => (p("模型回复语音输出", "Speak model replies"), Some(p("使用配置的 TTS 服务播放模型回复", "Play model replies through the configured TTS service")), self.settings.simo.voice_output),
             // The version this is, where the user looks for a newer one.
             Switch::Updates => {
                 return (p("自动检查更新", "Check for updates"), Some(Cow::Borrowed(p("每天检查一次，并向 Glance 网站告知当前版本，用于统计使用情况。发送过诊断信息时，一并获取其回复。不包含可识别这台电脑的信息", "Once a day. Glance's site is told this version, to count how many run it, and asked for replies to the diagnostics sent. Nothing that tells this PC from another"))), self.settings.check_updates);
@@ -5066,11 +5225,14 @@ impl Ui {
         let settings = &mut self.settings;
         match switch {
             Switch::Live => settings.live_backdrop ^= true,
+            Switch::RunningWindows => settings.station.running_windows ^= true,
             Switch::TearOff => settings.tear_off ^= true,
             Switch::Updates => settings.check_updates ^= true,
             Switch::HeatAlert => settings.heat_alert ^= true,
             Switch::TrayHidden => settings.tray_hidden ^= true,
             Switch::NearbyNotice => settings.nearby_notice ^= true,
+            Switch::SimoEnabled => settings.simo.enabled ^= true,
+            Switch::SimoVoice => settings.simo.voice_output ^= true,
             Switch::Nearby => {
                 // What the system then reports, not what was asked (see `tick`).
                 if self.remote_there && self.switching.is_none() && self.reading_switches.is_none() {
@@ -6037,6 +6199,14 @@ It can be disconnected here at any time, and the status line command put back.",
                 self.settings.storage_folders.retain(|had| *had != path);
                 self.save();
             }
+            Target::SimoStorage if self.choosing_simo_storage.is_none() => {
+                let (hwnd, lang) = (self.hwnd.0 as isize, self.lang);
+                self.choosing_simo_storage = Some(std::thread::spawn(move || unsafe {
+                    let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+                    super::beside::choose(HWND(hwnd as *mut _), super::beside::Kinds::Folders, lang)
+                }));
+            }
+            Target::SimoStorage => {}
             Target::CheckNow => update::check_now(update::Asker::Settings),
             Target::Module(id) => {
                 let (list, bare) = self.list(&id);
@@ -6188,6 +6358,19 @@ It can be disconnected here at any time, and the status line command put back.",
             }
             Target::Manage => self.turn_to(Page::Devices),
             Target::PcName => self.begin_name_pc(),
+            Target::SimoField(field) => {
+                let value = match field {
+                    SimoField::ApiBaseUrl => self.settings.simo.api_base_url.clone(),
+                    SimoField::ApiKey => self.settings.simo.api_key.clone(),
+                    SimoField::Model => self.settings.simo.model.clone(),
+                    SimoField::TtsBaseUrl => self.settings.simo.tts_base_url.clone(),
+                    SimoField::TtsModel => self.settings.simo.tts_model.clone(),
+                    SimoField::TtsVoice => self.settings.simo.tts_voice.clone(),
+                };
+                self.begin_naming(Named::Simo(field), &value, 2048);
+            }
+            Target::SimoRefresh => self.refresh_simo(),
+            Target::SimoModels => self.open_simo_models(),
             // (Gone from the list at once; the helper told, and as it then says.)
             Target::Untrust(fingerprint) => {
                 if let Some(nearby) = self.nearby.as_mut() {
@@ -6292,6 +6475,12 @@ It can be disconnected here at any time, and the status line command put back.",
                 Row::Quit => vec![Target::Quit],
                 Row::Guide => vec![Target::Guide],
                 Row::PcName => vec![Target::PcName],
+                Row::SimoField(SimoField::Model) => if self.settings.simo.models.is_empty() { vec![] } else { vec![Target::SimoModels] },
+                Row::SimoField(field) => vec![Target::SimoField(field)],
+                Row::SimoRefresh if self.simo_loading.is_some() => vec![],
+                Row::SimoRefresh => vec![Target::SimoRefresh],
+                Row::SimoStorage if self.choosing_simo_storage.is_some() => vec![],
+                Row::SimoStorage => vec![Target::SimoStorage],
                 Row::Device(Known::Phone(id)) => vec![Target::OpenPhone(id)],
                 Row::Device(Known::Trusted(fingerprint)) => vec![Target::Untrust(fingerprint)],
                 // (Only while its card is open, as a module's items.)
@@ -6450,6 +6639,8 @@ It can be disconnected here at any time, and the status line command put back.",
         let row = self.layout().into_iter().find(|(row, ..)| match (row, &focus) {
             (Row::Skins, Target::Skin(_)) | (Row::Update, Target::Update | Target::Download) | (Row::Notice, Target::NoticeRead | Target::NoticeLink) | (Row::Diagnostics, Target::Diagnostics | Target::SendReport) | (Row::Uninstall, Target::Uninstall) | (Row::Quit, Target::Quit) | (Row::Guide, Target::Guide) => true,
             (Row::Version, Target::CheckNow) => true,
+            (Row::SimoRefresh, Target::SimoRefresh) | (Row::SimoField(SimoField::Model), Target::SimoModels) | (Row::SimoStorage, Target::SimoStorage) => true,
+            (Row::SimoField(a), Target::SimoField(b)) => a == b,
             (Row::Shortcut(a), Target::Shortcut(b) | Target::ClearShortcut(b)) => a == b,
             (Row::Manage(_), Target::Manage) => true,
             (Row::NetEase, Target::NetEase(_) | Target::NetEaseRestart) => true,
@@ -6740,6 +6931,7 @@ It can be disconnected here at any time, and the status line command put back.",
     /// waits on it, and its frames, begun while this window's was being drawn, were not drawn, nor this one after
     /// (see `gfx::Frame::whole`).
     fn advance(&mut self, now: Instant) {
+        self.poll_simo(now);
         let lang = self.lang;
         // The diagnostics sent: how that went, once it is over.
         if self.sending.as_ref().is_some_and(|sending| sending.is_finished()) {
@@ -6929,6 +7121,20 @@ It can be disconnected here at any time, and the status line command put back.",
             if let Some(folder) = chosen.into_iter().next() {
                 self.settings.nearby_folder = Some(folder);
                 self.save();
+            }
+            self.next_frame = now;
+        }
+        if self.choosing_simo_storage.as_ref().is_some_and(|choosing| choosing.is_finished()) {
+            let chosen = self.choosing_simo_storage.take().unwrap().join().unwrap_or_default();
+            if let Some(folder) = chosen.into_iter().next() {
+                let old = crate::simo::storage_dir(&self.settings.simo);
+                match crate::simo::move_storage(&old, &folder) {
+                    Ok(()) => {
+                        self.settings.simo.storage_dir = Some(folder);
+                        self.save();
+                    }
+                    Err(error) => crate::journal::note(format!("SIMO history: {error}")),
+                }
             }
             self.next_frame = now;
         }
@@ -7548,6 +7754,42 @@ It can be disconnected here at any time, and the status line command put back.",
                         self.targets.truncate(targets);
                     }
                 }
+                Row::SimoField(field) => {
+                    card(frame, palette, left, y, width, row_height, palette.card);
+                    let (name, value) = self.simo_field_words(field);
+                    let cy = y + row_height / 2.0;
+                    let field_width = (width * 0.53).min(210.0);
+                    field_label_in(frame, (palette.text, palette.text2), name, None, label, hint, left + ROW_SIDE, cy, width - ROW_SIDE * 2.0 - field_width - 10.0);
+                    let field_rect = Rect { x: left + width - ROW_SIDE - field_width, y: cy - 14.0, w: field_width, h: 28.0 };
+                    if field == SimoField::Model {
+                        let short: String = value.chars().take(24).collect();
+                        let kind = if self.settings.simo.models.is_empty() { Button::QuietMenu } else { Button::Menu };
+                        self.button(frame, palette, &short, left + width - ROW_SIDE, cy, Target::SimoModels, kind, &hovered);
+                    } else if self.renaming.as_ref().is_some_and(|edit| edit.of == Named::Simo(field)) {
+                        self.paint_rename(frame, palette, label, field_rect.x + 8.0, cy, field_width - 8.0, now);
+                    } else {
+                        fill(frame, palette.control, field_rect.x, field_rect.y, field_rect.w, field_rect.h, 6.0);
+                        stroke_inside(frame, field_rect, 6.0, palette.rule);
+                        frame.clip(field_rect.x + 8.0, field_rect.y, field_rect.w - 16.0, field_rect.h);
+                        text_centred(frame, &value, label, palette.text, field_rect.x + 8.0, cy, field_rect.w - 16.0, Align::Start);
+                        frame.unclip();
+                        self.targets.push((field_rect, Target::SimoField(field)));
+                    }
+                }
+                Row::SimoRefresh => {
+                    card(frame, palette, left, y, width, row_height, palette.card);
+                    let text = pick(self.lang, "刷新模型列表", "Refresh model list");
+                    let detail = match (&self.simo_loading, &self.simo_result, self.settings.simo.models.is_empty()) {
+                        (Some(_), ..) => pick(lang, "正在加载模型…", "Loading models…"),
+                        (_, Some(Err(_)), _) => pick(lang, "加载失败，请检查地址和密钥", "Loading failed. Check the URL and key"),
+                        (_, Some(Ok(())), true) => pick(lang, "接口未返回模型", "The provider returned no models"),
+                        (_, None, true) => pick(lang, "尚未加载模型", "No models loaded yet"),
+                        _ => pick(lang, "从 /models 重新读取", "Reload from /models"),
+                    };
+                    field_label_in(frame, (palette.text, palette.text2), text, Some(detail), label, hint, left + ROW_SIDE, y + row_height / 2.0, width - ROW_SIDE * 2.0 - 120.0);
+                    let kind = if self.simo_loading.is_some() { Button::Quiet } else { Button::Plain };
+                    self.button(frame, palette, pick(self.lang, "刷新", "Refresh"), left + width - ROW_SIDE, y + row_height / 2.0, Target::SimoRefresh, kind, &hovered);
+                }
                 Row::Group(name) => {
                     let small = Font::new(Family::Segoe, 13.0, 600.0);
                     text_centred(frame, name, small, palette.text2, left + 4.0, y + row_height / 2.0, width, Align::Start);
@@ -7568,7 +7810,7 @@ It can be disconnected here at any time, and the status line command put back.",
                     frame.icon(Icon::Megaphone, Point { x: left + ROW_SIDE + 8.0, y: top + 10.0 }, 16.0, palette.selection);
                     field_label(frame, palette, &name, Some(&detail), Font::new(Family::Segoe, 14.0, 600.0), hint, words_left, y + row_height / 2.0, room);
                 }
-                Row::Update | Row::Version | Row::Shortcut(_) | Row::Diagnostics | Row::Guide | Row::MyReports | Row::Report(_) | Row::Uninstall | Row::Quit | Row::Manage(_) | Row::NetEase | Row::ClaudeLimits | Row::RecentFolder(_) | Row::AddRecentFolder | Row::NearbyFolder => {
+                Row::Update | Row::Version | Row::Shortcut(_) | Row::Diagnostics | Row::Guide | Row::MyReports | Row::Report(_) | Row::Uninstall | Row::Quit | Row::Manage(_) | Row::NetEase | Row::ClaudeLimits | Row::RecentFolder(_) | Row::AddRecentFolder | Row::NearbyFolder | Row::SimoStorage => {
                     let Some((name, detail, buttons)) = self.button_row(&row, now) else { continue };
                     card(frame, palette, left, y, width, row_height, palette.card);
                     let mut right = left + width - ROW_SIDE;
@@ -8485,6 +8727,29 @@ It can be disconnected here at any time, and the status line command put back.",
     /// with the whole panel and a strip of desktop beside it. Returns how fast the panel's charts move (physical pixels
     /// a second), and where the screen was drawn.
     fn panel_on_stage(&mut self, frame: &Frame, area: Rect, panel: Option<(Edge, &Prefs, Part)>, whole: bool, out: f32) -> (Option<f32>, Rect) {
+        if let Some((edge, _, Part::Simo)) = panel {
+            let (_, screen) = self.panel_on_stage(frame, area, None, true, 1.0);
+            let (sw, sh) = self.stage.size;
+            let (pw, ph) = (crate::ui::simo::WIDTH, crate::ui::simo::HEIGHT);
+            let scale = (screen.w / sw).min(screen.h / sh).min(1.0);
+            let fit = (screen.w / pw).min(screen.h / ph).min(scale * 1.4);
+            let (w, h) = (pw * fit, ph * fit);
+            let inset = 8.0 * scale;
+            let away = 1.0 - out;
+            let (x, y) = match edge {
+                Edge::Left => (screen.x + inset - away * (w + inset + GAP), screen.y + (screen.h - h) / 2.0),
+                Edge::Right => (screen.x + screen.w - inset - w + away * (w + inset + GAP), screen.y + (screen.h - h) / 2.0),
+                Edge::Top => (screen.x + (screen.w - w) / 2.0, screen.y + inset - away * (h + inset + GAP)),
+            };
+            unsafe { frame.dc.PushAxisAlignedClip(&rect(screen.x, screen.y, screen.w, screen.h), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
+            frame.place(Matrix3x2::translation(x, y));
+            let theme = Theme::new(Skin::named(&self.settings.skin), self.dark);
+            let mut chat = crate::simo::Chat::default();
+            crate::ui::simo::paint(frame, &theme, &mut chat, (pw, ph), Instant::now());
+            frame.origin(0.0, 0.0);
+            unsafe { frame.dc.PopAxisAlignedClip() };
+            return (None, screen);
+        }
         let staged = self.stage_panel(frame, area, panel, Staging { whole, out, ..Staging::default() });
         (staged.plot, staged.screen)
     }

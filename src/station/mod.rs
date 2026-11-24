@@ -15,6 +15,7 @@ pub mod select;
 pub mod send;
 pub mod shelf;
 pub mod thumbs;
+pub mod windows;
 #[cfg(test)]
 mod spike;
 
@@ -134,7 +135,7 @@ pub fn pressed(hit: crate::ui::view::Hit) -> bool {
     match hit {
         // A thing on it, or copied lately: put on the clipboard (pressed again within a double click's time, opened).
         Hit::Shelf(id) | Hit::Copied(id) => {
-            let double = std::time::Duration::from_millis(u64::from(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() }));
+            let double = std::time::Duration::from_millis(u64::from(unsafe { ::windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() }));
             let mut last = LAST.lock().unwrap();
             let again = last.is_some_and(|(was, at)| was == id && at.elapsed() <= double);
             *last = (!again).then(|| (id, std::time::Instant::now()));
@@ -159,11 +160,12 @@ pub fn pressed(hit: crate::ui::view::Hit) -> bool {
                 run::ask(run::Ask::Launch(app.target.clone()));
             }
         }
+        Hit::RunningWindow(handle) => windows::activate(handle),
         // A file come lately: put on the clipboard as a file (pressed again within a double click's time, opened).
         // Files come together: put on the clipboard (pressed again, their folder opened, showing them chosen: opened,
         // a phone's photos would open hundreds of windows).
         Hit::Recent(entry) => {
-            let double = std::time::Duration::from_millis(u64::from(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() }));
+            let double = std::time::Duration::from_millis(u64::from(unsafe { ::windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() }));
             static LAST_FILE: std::sync::Mutex<Option<(recent::Entry, std::time::Instant)>> = std::sync::Mutex::new(None);
             let mut last = LAST_FILE.lock().unwrap();
             let again = last.is_some_and(|(was, at)| was == entry && at.elapsed() <= double);
@@ -227,7 +229,7 @@ pub enum TagsChoice {
 }
 
 /// The menu of the tags of `thing` (its button pressed), at `at` on the screen: up, with what its rows do.
-pub fn tags_menu(thing: Thing, at: windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<TagsChoice>)> {
+pub fn tags_menu(thing: Thing, at: ::windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<TagsChoice>)> {
     let (rows, chosen) = tag_rows(&[thing], TagsChoice::Tag, TagsChoice::New);
     Some((crate::ui::menu::Menu::open_at(rows, look, at, false, over_the_panel)?, chosen))
 }
@@ -249,7 +251,7 @@ pub enum TagChoice {
 
 /// The menu of the tag `id` (a right click on it, or its button), at `at` on the screen: up, with what its rows do, and
 /// its name.
-pub fn tag_menu(id: u32, at: windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<TagChoice>, String)> {
+pub fn tag_menu(id: u32, at: ::windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<TagChoice>, String)> {
     use crate::ui::icons::Icon;
     use crate::ui::menu::{Item, Mark, Menu};
     let name = run::shown().tags.iter().find(|tag| tag.id == id)?.name.clone();
@@ -265,7 +267,7 @@ pub fn renaming_tag(id: u32, name: String) -> crate::ui::rename::Naming {
 
 /// The menu of the thing `id` on the station (a right click on it), at `at` on the screen (`over_the_panel`: as
 /// `Menu::open_at` says): up, with what its rows do.
-pub fn menu(id: u64, at: windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<Choice>)> {
+pub fn menu(id: u64, at: ::windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<Choice>)> {
     use crate::ui::icons::Icon;
     use crate::ui::menu::{Item, Menu};
     use shelf::What;
@@ -397,7 +399,7 @@ pub fn many_choices(hits: &[crate::ui::view::Hit], items: &[shelf::Item], came: 
 
 /// The menu of `hits`, chosen together (a right click on one of them), at `at` on the screen (`over_the_panel`: as
 /// `Menu::open_at` says): up, with what its rows do (see `many_choices`).
-pub fn many_menu(hits: &[crate::ui::view::Hit], at: windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<ManyChoice>)> {
+pub fn many_menu(hits: &[crate::ui::view::Hit], at: ::windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<ManyChoice>)> {
     use crate::ui::icons::Icon;
     use crate::ui::menu::{Item, Menu};
     use crate::ui::view::Hit;
@@ -479,7 +481,7 @@ pub enum RecentChoice {
 
 /// The menu of `entry` among the files come lately (a right click on it), at `at` on the screen: up, with what its
 /// rows do.
-pub fn recent_menu(entry: recent::Entry, at: windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<RecentChoice>)> {
+pub fn recent_menu(entry: recent::Entry, at: ::windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<RecentChoice>)> {
     use crate::ui::icons::Icon;
     use crate::ui::menu::{Item, Menu};
     recent::paths_of(entry)?;
@@ -576,7 +578,7 @@ fn app_rows(app: &apps::App, lang: crate::ui::text::Lang) -> Vec<(AppChoice, &'s
 
 /// The menu of the thing kept at hand at `at` among them (a right click on it), at `point` on the screen: up, with
 /// what its rows do (where it is is shown only for what is on the disk).
-pub fn app_menu(number: u64, point: windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<AppChoice>, apps::App)> {
+pub fn app_menu(number: u64, point: ::windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<AppChoice>, apps::App)> {
     use crate::ui::menu::{Item, Menu};
     let app = apps::numbered(number)?;
     let rows = app_rows(&app, crate::update::language());
@@ -618,7 +620,7 @@ pub enum HeadChoice {
 
 /// The menu a press on the station's head opens (`hit`: the button of how what is on it shows, or of the rest, the
 /// page `tab` shown), at `at` on the screen (`over_the_panel`: as `Menu::open_at` says): up, with what its rows do.
-pub fn head_menu(hit: crate::ui::view::Hit, tab: crate::ui::view::Tab, at: windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<HeadChoice>)> {
+pub fn head_menu(hit: crate::ui::view::Hit, tab: crate::ui::view::Tab, at: ::windows::Win32::Foundation::POINT, over_the_panel: bool, look: crate::ui::menu::Look) -> Option<(crate::ui::menu::Menu, Vec<HeadChoice>)> {
     use crate::settings::ShelfView;
     use crate::ui::icons::Icon;
     use crate::ui::menu::{Item, Menu};
@@ -669,7 +671,7 @@ pub fn head_menu(hit: crate::ui::view::Hit, tab: crate::ui::view::Tab, at: windo
 
 /// `choice` made in a menu of the station's head (see `head_menu`): done (the settings changed off the calling thread,
 /// which they tell to restyle).
-pub fn head_chose(choice: HeadChoice, place: Option<windows::Win32::Foundation::RECT>) {
+pub fn head_chose(choice: HeadChoice, place: Option<::windows::Win32::Foundation::RECT>) {
     match choice {
         HeadChoice::View(page, view) => {
             std::thread::spawn(move || {

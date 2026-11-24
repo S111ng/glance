@@ -262,6 +262,8 @@ pub enum Hit {
     /// What is kept at hand, by its place (see `station::apps`); the place to add more; where something dragged may
     /// be dropped to be kept at hand.
     App(u64),
+    /// A currently open top-level window, by its HWND.
+    RunningWindow(isize),
     /// While one kept at hand is held and dragged: the place among them the pointer is at (where it would go; these
     /// stand still as the others move to make room, so that what the pointer is over is not moved from under it).
     AppSlot(u16),
@@ -1524,6 +1526,7 @@ pub fn named(hits: &[HitBox], hit: Hit, lang: Lang) -> Option<String> {
         Hit::Shelf(id) | Hit::Copied(id) => crate::station::run::shown().items.iter().find(|item| item.id == id).map(|item| Tile::of(item, &[], &crate::station::folder::Folder::own(), lang, 0).label),
         Hit::Recent(entry) => Lately::entry(&crate::station::recent::shown(), entry, lang, 0).map(|row| row.label),
         Hit::App(number) => crate::station::apps::numbered(number).and_then(|app| crate::station::apps::named().into_iter().find(|(_, target)| *target == app.target)).map(|(name, _)| name),
+        Hit::RunningWindow(handle) => crate::station::windows::title(handle),
         _ => None,
     }
 }
@@ -2581,6 +2584,7 @@ fn app_spot(scene: &Scene, target: &str, at: usize, cell: &dyn Fn(usize) -> (f32
 fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: RailSide, hits: &mut Vec<HitBox>) {
     let theme = scene.theme;
     let (apps, over): (&[(String, String)], bool) = lane.blocks.iter().find_map(|block| if let Block::Apps { apps, over, .. } = block { Some((apps.as_slice(), *over)) } else { None }).unwrap_or((&[], false));
+    let running = if crate::APP.get().is_some_and(|app| app.settings.lock().unwrap().station.running_windows) { crate::station::windows::shown() } else { Vec::new() };
     let across = side == RailSide::Bottom;
     let foot = RAIL_FOOT;
     // Each thing's cell: square round its picture; named (see `apps::always_named`), as wide as the rail down a side (as tall as
@@ -2603,7 +2607,7 @@ fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: 
     };
     let lit_on = |hit: Hit| scene.hover == Some(hit);
     // Its things, and the place to add more after them, scrolled along by the wheel where they are more than fit.
-    let whole = (apps.len() + 1) as f32 * along;
+    let whole = (running.len() + apps.len() + 1) as f32 * along;
     let most = (whole - length).max(0.0);
     let scroll = scene.scrolls.at(List::Apps).clamp(0.0, most);
     let (view_x, view_y, view_w, view_h) = if across { (start, area.y, length, area.h) } else { (area.x, start, area.w, length) };
@@ -2616,20 +2620,28 @@ fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: 
     };
     // (The one held: along the rail as the pointer has it, in its middle across it.)
     let held_cell = |(px, py): (f32, f32)| if across { (px - cell_w / 2.0, area.y + (area.h - cell_h) / 2.0) } else { (area.x + (area.w - cell_w) / 2.0, py - cell_h / 2.0) };
-    for at in 0..=apps.len() {
-        // Each in its place, or on its way to it; the one held drawn after all, where the pointer has it.
-        let spot = match apps.get(at) {
-            Some((_, target)) => app_spot(scene, target, at, &shown_cell, &held_cell),
-            None => Some(shown_cell(at)),
-        };
-        let Some((x, y)) = spot else { continue };
-        if if across { x + cell_w < view_x || x > view_x + view_w } else { y + cell_h < view_y || y > view_y + view_h } {
-            continue;
+    let in_view = |x: f32, y: f32| if across { x + cell_w >= view_x && x <= view_x + view_w } else { y + cell_h >= view_y && y <= view_y + view_h };
+    crate::station::windows::keep_icons(&running);
+    for (at, window) in running.iter().enumerate() {
+        let (x, y) = shown_cell(at);
+        if !in_view(x, y) { continue; }
+        let hit = Hit::RunningWindow(window.handle);
+        if lit_on(hit) {
+            app_plate(frame, theme, (x + 2.0, y + 2.0, RAIL_CELL - 4.0), (RAIL_CELL - 4.0 - RAIL_SIDE) / 2.0);
         }
-        let Some((name, target)) = apps.get(at) else {
-            paint_adder(frame, scene, x + picture_x, y + picture_y, RAIL_SIDE, over, &mut placed);
-            continue;
-        };
+        if let Some(icon) = crate::station::windows::icon(window, (RAIL_SIDE * frame.pixels_per_dip()).ceil().clamp(32.0, 256.0) as u32) {
+            let (left, top, width, height) = icon.fitted_in(x + picture_x, y + picture_y, RAIL_SIDE, RAIL_SIDE);
+            frame.picture(&icon, left, top, width, height, 0.0, 1.0);
+        } else {
+            frame.icon(Icon::AppWindow, Point { x: x + cell_w / 2.0, y: y + cell_h / 2.0 }, RAIL_SIDE * 0.68, theme.text2);
+        }
+        placed.push((x, y, cell_w, cell_h, hit));
+        placed.push((x, y, cell_w, cell_h, Hit::Shortened));
+    }
+    let app_cell = |at: usize| shown_cell(running.len() + at);
+    for (at, (name, target)) in apps.iter().enumerate() {
+        let Some((x, y)) = app_spot(scene, target, at, &app_cell, &held_cell) else { continue };
+        if !in_view(x, y) { continue; }
         let hit = Hit::App(crate::station::apps::number_of(target));
         if lit_on(hit) {
             frame.fill_rounded(theme.hover, x + 2.0, y + 2.0, cell_w - 4.0, cell_h - 4.0, plate_round(theme, GLASS_ROW_ROUND, (cell_w.min(cell_h) - 4.0 - RAIL_SIDE) / 2.0));
@@ -2643,6 +2655,10 @@ fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: 
         }
         placed.push((x, y, cell_w, cell_h, hit));
         name_shown(&mut placed, hit, name, &shown);
+    }
+    let (x, y) = shown_cell(running.len() + apps.len());
+    if in_view(x, y) {
+        paint_adder(frame, scene, x + picture_x, y + picture_y, RAIL_SIDE, over, &mut placed);
     }
     // The one held, lifted where the pointer has it along the rail; the places it may go to, standing still, all of
     // the rail between them (before the first, past the last).
@@ -2659,7 +2675,7 @@ fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: 
     // The places one dragged among them may go to, standing still (see `Hit::AppSlot`), all of the rail between them
     // (before the first, past the last, the "+" over it): after all else.
     let places: Vec<HitBox> = (0..apps.len()).map(|at| {
-        let (x, y) = shown_cell(at);
+        let (x, y) = shown_cell(running.len() + at);
         let (lead, tail) = (if at == 0 { 1000.0 } else { 0.0 }, if at + 1 == apps.len() { 1000.0 } else { 0.0 });
         if across { (x - lead, area.y, along + lead + tail, area.h, Hit::AppSlot(at as u16)) } else { (area.x, y - lead, area.w, along + lead + tail, Hit::AppSlot(at as u16)) }
     }).collect();
