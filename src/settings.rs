@@ -197,10 +197,12 @@ pub enum Part {
     Workbench,
     /// What plays, its lyrics and its controls.
     Music,
+    /// The SIMO GPT conversation.
+    Simo,
 }
 
 /// Every component there is, in the order the settings offer them.
-pub const PARTS: [Part; 3] = [Part::Monitor, Part::Workbench, Part::Music];
+pub const PARTS: [Part; 4] = [Part::Monitor, Part::Workbench, Part::Music, Part::Simo];
 
 /// One edge of a screen and the component it opens.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -704,7 +706,7 @@ impl PanelSizes {
         let sized = match part {
             Part::Monitor => &self.monitor,
             Part::Workbench => &self.workbench,
-            Part::Music => return 1.0,
+            Part::Music | Part::Simo => return 1.0,
         };
         sized.get(screen.unwrap_or_default()).copied().unwrap_or(otherwise)
     }
@@ -830,6 +832,9 @@ pub struct Settings {
     pub widgets: Vec<WidgetAt>,
     /// The player music is followed from, while it plays (see `media::choose_music`); none: as Glance picks.
     pub music_source: Option<MusicSource>,
+    /// SIMO's provider, model and voice output settings.
+    #[serde(default)]
+    pub simo: crate::simo::Settings,
     /// The station's (see `station`).
     #[serde(default)]
     pub station: StationSettings,
@@ -863,6 +868,10 @@ pub struct Settings {
     /// Whether what a device nearby sends is told at the screen's edge while the panel is put away (see `ui::peek`): a
     /// device asking to send is asked about there either way.
     pub nearby_notice: bool,
+    /// Where what devices nearby send goes, under the names it came with, where the user chose a folder for it (none:
+    /// kept by the station, see `station::keep`).
+    #[serde(default)]
+    pub nearby_folder: Option<std::path::PathBuf>,
     pub view: serde_json::Value,
 }
 
@@ -925,6 +934,8 @@ pub enum NotesView {
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StationSettings {
+    /// Whether visible windows are listed before quick launch on the workbench rail.
+    pub running_windows: bool,
     /// What is copied kept in Recently copied.
     pub history: bool,
     /// The files come lately listed (see `station::recent`).
@@ -943,7 +954,7 @@ pub struct StationSettings {
 
 impl Default for StationSettings {
     fn default() -> Self {
-        StationSettings { history: true, recent: true, view: ShelfView::Cards, copies_view: ShelfView::List, recent_view: ShelfView::List, keep_days: 7, always_copy: false, remove_after_drag: false }
+        StationSettings { running_windows: true, history: true, recent: true, view: ShelfView::Cards, copies_view: ShelfView::List, recent_view: ShelfView::List, keep_days: 7, always_copy: false, remove_after_drag: false }
     }
 }
 
@@ -1004,6 +1015,7 @@ impl Default for Settings {
             music_rooms: MusicRooms::default(),
             widgets: Vec::new(),
             music_source: None,
+            simo: crate::simo::Settings::default(),
             station: StationSettings::default(),
             recent_hidden: Vec::new(),
             recent_hidden_drives: Vec::new(),
@@ -1015,6 +1027,7 @@ impl Default for Settings {
             notes_source: false,
             todo_times: todo_times(),
             nearby_notice: true,
+            nearby_folder: None,
             view: serde_json::Value::Null,
         }
     }
@@ -1042,7 +1055,7 @@ impl Settings {
         let sized = match part {
             Part::Monitor => &mut self.part_sizes.monitor,
             Part::Workbench => &mut self.part_sizes.workbench,
-            Part::Music => return,
+            Part::Music | Part::Simo => return,
         };
         sized.insert(screen.unwrap_or_default().to_string(), size);
     }
@@ -1051,7 +1064,7 @@ impl Settings {
     pub fn columns_of(&self, part: Part) -> Option<usize> {
         match part {
             Part::Workbench => self.workbench_columns,
-            Part::Monitor | Part::Music => self.columns,
+            Part::Monitor | Part::Music | Part::Simo => self.columns,
         }
     }
 
@@ -1059,7 +1072,7 @@ impl Settings {
     pub fn set_columns(&mut self, part: Part, columns: Option<usize>) {
         match part {
             Part::Workbench => self.workbench_columns = columns,
-            Part::Monitor | Part::Music => self.columns = columns,
+            Part::Monitor | Part::Music | Part::Simo => self.columns = columns,
         }
     }
 

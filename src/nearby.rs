@@ -60,6 +60,9 @@ pub struct Device {
     pub model: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
+    /// It said it is Glance's (a PC's or a phone's), not only LocalSend's.
+    #[serde(default)]
+    pub glance: bool,
 }
 
 /// How a sending of this PC's goes.
@@ -101,6 +104,31 @@ pub struct Outgoing {
     pub bytes: u64,
 }
 
+/// What a sending gives the device (see `send`), each with the name the device is told: a file where it is, or words
+/// (sent as LocalSend sends text: alone, a message the device shows as words; with files, a text file beside them).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Part {
+    File(PathBuf, String),
+    Words(String, String),
+}
+
+impl Part {
+    /// The name the device is told.
+    pub fn name(&self) -> &str {
+        match self {
+            Part::File(_, name) | Part::Words(_, name) => name,
+        }
+    }
+
+    /// How large it is (bytes): a file as it is now (none where it cannot be read), words as UTF-8.
+    fn size(&self) -> Option<u64> {
+        match self {
+            Part::File(path, _) => std::fs::metadata(path).ok().map(|meta| meta.len()),
+            Part::Words(words, _) => Some(words.len() as u64),
+        }
+    }
+}
+
 /// What the helper tells.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -115,6 +143,8 @@ enum Told {
     Came { session: String, short: Option<String> },
     Devices { devices: Vec<Device> },
     Sending { job: u64, state: Sending },
+    /// A device found, trusted (what the helper keeps says so now), or why not.
+    Trusted { fingerprint: String, why_not: Option<String> },
 }
 
 /// A device's sending the user is asked about.
@@ -146,6 +176,9 @@ pub struct Shown {
     pub sendings: HashMap<u64, Sending>,
     /// What each sending sends, to whom.
     pub outgoing: HashMap<u64, Outgoing>,
+    /// The devices found that are being trusted (see `trust`), by their fingerprints: none while the helper reaches
+    /// one, and why not where it could not be.
+    pub trusting: HashMap<String, Option<String>>,
 }
 
 static SHOWN: Mutex<Option<Shown>> = Mutex::new(None);
@@ -172,6 +205,12 @@ pub fn pretend_devices(devices: Vec<Device>) {
     change(|shown| shown.devices = devices);
 }
 
+/// For pictures: this PC's sendings as if the helper had told these.
+#[cfg(all(test, feature = "studio"))]
+pub fn pretend_sendings(sendings: HashMap<u64, Sending>) {
+    change(|shown| shown.sendings = sendings);
+}
+
 fn change(act: impl FnOnce(&mut Shown)) {
     act(SHOWN.lock().unwrap().get_or_insert_with(Shown::default));
     if let Some(told) = TOLD.get() {
@@ -187,6 +226,7 @@ pub fn start(told: impl Fn() + Send + Sync + 'static) {
     }
     crate::station::run::ask(crate::station::run::Ask::Arrivals(None));
     std::thread::Builder::new().name("glance: nearby".into()).spawn(serve).expect("a thread started");
+    std::thread::Builder::new().name("glance: nearby let go".into()).spawn(sending_let_go).expect("a thread started");
 }
 
 /// The answer to what the helper asked (`id`): whether to take it, and whether to take what that device sends from
@@ -196,22 +236,67 @@ pub fn answer(id: u64, take: bool, trust: bool) {
     command(&json!({ "kind": "answer", "id": id, "take": take, "trust": trust }));
 }
 
+/// A device this PC may send to: its fingerprint, what it calls itself (a paired phone not found, what it was paired
+/// as; nothing said, empty), its kind and model (as LocalSend says them), whether it is a phone paired with this PC,
+/// whether it is Glance's, and whether it is found nearby now (one not found is not reached: a paired phone not
+/// receiving).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Target {
+    pub fingerprint: String,
+    pub name: String,
+    pub kind: Option<String>,
+    pub model: Option<String>,
+    pub paired: bool,
+    pub glance: bool,
+    pub found: bool,
+}
+
+/// The devices this PC may send to, as `devices` are found nearby: the phones paired (`phones`, those a browser is
+/// paired as left out: a page receives nothing), each by the certificate it told (`trusted`), found or not; then the
+/// others found, Glance's first, by name.
+pub fn targets(devices: &[Device], phones: &[crate::phone::Phone], trusted: &[crate::phone::Trusted]) -> Vec<Target> {
+    let found_of = |fingerprint: &str| devices.iter().find(|device| device.fingerprint.eq_ignore_ascii_case(fingerprint));
+    let model = |device: Option<&Device>| device.and_then(|device| device.model.clone()).filter(|model| !model.trim().is_empty());
+    let mut targets: Vec<Target> = Vec::new();
+    for phone in phones.iter().filter(|phone| !phone.web) {
+        let Some(fingerprint) = trusted.iter().find(|trusted| trusted.phone.as_deref() == Some(phone.id.as_str())).map(|trusted| trusted.fingerprint.clone()) else { continue };
+        let found = found_of(&fingerprint);
+        let name = found.map(|device| device.alias.clone()).filter(|alias| !alias.is_empty()).unwrap_or_else(|| phone.name.clone());
+        targets.push(Target { fingerprint, name, kind: Some("mobile".into()), model: model(found), paired: true, glance: true, found: found.is_some() });
+    }
+    let mut others: Vec<&Device> = devices.iter().filter(|device| !targets.iter().any(|target| target.fingerprint.eq_ignore_ascii_case(&device.fingerprint))).collect();
+    others.sort_by_key(|device| (!device.glance, device.alias.to_lowercase()));
+    targets.extend(others.into_iter().map(|device| Target { fingerprint: device.fingerprint.clone(), name: device.alias.clone(), kind: device.kind.clone(), model: model(Some(device)), paired: false, glance: device.glance, found: true }));
+    targets
+}
+
+/// The devices this PC may send to now (see `targets`): the phones paired and the certificates trusted as the helper
+/// keeps them, the devices as they are found.
+pub fn targets_now() -> Vec<Target> {
+    targets(&shown().devices, &crate::phone::phones(), &crate::phone::trusted_kept())
+}
+
+/// The devices a sending of this PC's goes to now, by their fingerprints (as `shown` says).
+pub fn sending_to(shown: &Shown) -> Vec<String> {
+    shown.outgoing.iter().filter(|(job, _)| shown.sendings.get(job).is_none_or(|state| !state.over())).map(|(_, outgoing)| outgoing.to.clone()).collect()
+}
+
 /// A number for a sending of this PC's, none other's.
 pub fn job() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `files` (each where it is, and the name the device is told) sent to the device `to` (its fingerprint), as sending
-/// `job` (see `job`). Nothing to send, or the helper not there to be asked, it failed at once. The station is told as
-/// it is over (see `station::run::Ask::Sent`).
-pub fn send(job: u64, to: &str, files: &[(PathBuf, String)]) {
+/// `files` (each a file where it is or words, and the name the device is told: see `Part`) sent to the device `to`
+/// (its fingerprint), as sending `job` (see `job`). Nothing to send, or the helper not there to be asked, it failed at
+/// once. The station is told as it is over (see `station::run::Ask::Sent`).
+pub fn send(job: u64, to: &str, files: &[Part]) {
     if files.is_empty() {
         sending(job, Sending::Failed { why: "nothing to send".into() });
         return;
     }
-    let bytes = files.iter().filter_map(|(path, _)| std::fs::metadata(path).ok()).map(|meta| meta.len()).sum();
-    let first = files[0].1.rsplit('/').next().unwrap_or_default().to_string();
+    let bytes = files.iter().filter_map(Part::size).sum();
+    let first = files[0].name().rsplit('/').next().unwrap_or_default().to_string();
     change(|shown| {
         let device = shown.devices.iter().find(|device| device.fingerprint.eq_ignore_ascii_case(to));
         let (alias, kind) = device.map_or_else(|| (String::new(), None), |device| (device.alias.clone(), device.kind.clone()));
@@ -224,8 +309,14 @@ pub fn send(job: u64, to: &str, files: &[(PathBuf, String)]) {
 }
 
 /// What the helper is told to send `files` to `to` as sending `job` (see `send`).
-fn send_line(job: u64, to: &str, files: &[(PathBuf, String)]) -> serde_json::Value {
-    let files: Vec<serde_json::Value> = files.iter().map(|(path, name)| json!({ "path": path, "name": name })).collect();
+fn send_line(job: u64, to: &str, files: &[Part]) -> serde_json::Value {
+    let files: Vec<serde_json::Value> = files
+        .iter()
+        .map(|part| match part {
+            Part::File(path, name) => json!({ "path": path, "name": name }),
+            Part::Words(words, name) => json!({ "words": words, "name": name }),
+        })
+        .collect();
     json!({ "kind": "send", "job": job, "to": to, "files": files })
 }
 
@@ -285,6 +376,91 @@ pub fn room(bytes: u64) {
     });
 }
 
+/// The device found nearby by `fingerprint` trusted, once the helper has reached it and it proved it holds that
+/// certificate (how that goes: `Shown::trusting`). Whether the helper was there to be told.
+pub fn trust(fingerprint: &str) -> bool {
+    change(|shown| {
+        shown.trusting.insert(fingerprint.to_string(), None);
+    });
+    let told = command(&json!({ "kind": "trust", "fingerprint": fingerprint }));
+    if !told {
+        change(|shown| {
+            shown.trusting.insert(fingerprint.to_string(), Some("the helper is not there".into()));
+        });
+    }
+    told
+}
+
+/// How long the helper is kept running to send after sending was last wanted (see `want_to_send`), and how often that
+/// is looked at.
+const SENDING_KEPT: std::time::Duration = std::time::Duration::from_secs(60);
+const SENDING_LOOKED_AT: std::time::Duration = std::time::Duration::from_secs(5);
+/// After the helper could not be run to send, how long till it is tried again (while still wanted).
+const SENDING_TRIED_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// When sending was last wanted (see `want_to_send`), and whether a thread keeps the helper running for it.
+static SENDING_WANTED: Mutex<(Option<std::time::Instant>, bool)> = Mutex::new((None, false));
+
+/// Sending to devices nearby wanted now (where it can be chosen: the settings' sending pane shows, say): this PC found
+/// by them and they by it while receiving is off too. The helper is run for it (see `phone::turn_sending`, through the
+/// sensors: the firewall wants their rights) while it is wanted, and let go a while after it last was, no sending of
+/// this PC's under way then.
+pub fn want_to_send() {
+    let mut wanted = SENDING_WANTED.lock().unwrap();
+    wanted.0 = Some(std::time::Instant::now());
+    if wanted.1 {
+        return;
+    }
+    wanted.1 = true;
+    std::thread::Builder::new().name("glance: nearby sending".into()).spawn(keep_sending).expect("a thread started");
+}
+
+/// Keeps the helper running to send while that is wanted (see `want_to_send`): run for it where it runs for nothing
+/// that finds devices (receiving off), and let go once it is wanted no longer, the thread ending with it.
+fn keep_sending() {
+    use crate::link::Switch;
+    // (Whether the helper runs is asked of Task Scheduler.)
+    let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+    let mut tried: Option<std::time::Instant> = None;
+    loop {
+        let wanted = |at: Option<std::time::Instant>| at.is_some_and(|at| at.elapsed() < SENDING_KEPT) || shown().sendings.values().any(|state| !state.over());
+        if !wanted(SENDING_WANTED.lock().unwrap().0) {
+            if crate::phone::sending_on() {
+                crate::source::switch(Switch::NearbySend, false);
+            }
+            // (Wanted again meanwhile: kept, by this thread still.)
+            let mut held = SENDING_WANTED.lock().unwrap();
+            if !wanted(held.0) {
+                held.1 = false;
+                return;
+            }
+            continue;
+        }
+        let runs = crate::phone::nearby_on() || crate::phone::sending_on();
+        if !runs && tried.is_none_or(|at| at.elapsed() >= SENDING_TRIED_AGAIN) {
+            tried = Some(std::time::Instant::now());
+            crate::source::switch(Switch::NearbySend, true);
+        }
+        std::thread::sleep(SENDING_LOOKED_AT);
+    }
+}
+
+/// The helper no longer run to send where it was left so (Glance ended while sending was wanted): as Glance starts,
+/// nothing wants it yet. (Through the sensors, once they are reached: their rights close the firewall.)
+fn sending_let_go() {
+    let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+    if !crate::phone::sending_on() {
+        return;
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !crate::source::linked() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if !SENDING_WANTED.lock().unwrap().1 {
+        crate::source::switch(crate::link::Switch::NearbySend, false);
+    }
+}
+
 /// This PC announced to the devices nearby, and which they are said again (the devices are about to be shown).
 pub fn announce() -> bool {
     command(&json!({ "kind": "announce" }))
@@ -333,6 +509,15 @@ fn heard(told: Told) {
         }
         Told::Devices { devices } => change(|shown| shown.devices = devices),
         Told::Sending { job, state } => sending(job, state),
+        // (Trusted, it is gone from those being trusted: the settings read what the helper keeps again as it changes.)
+        Told::Trusted { fingerprint, why_not } => change(|shown| match why_not {
+            Some(why) => {
+                shown.trusting.insert(fingerprint, Some(why));
+            }
+            None => {
+                shown.trusting.remove(&fingerprint);
+            }
+        }),
     }
 }
 
@@ -599,11 +784,11 @@ mod tests {
     use super::*;
 
     /// What the helper is told to send, as it reads it (see its `link::Command::Send`): each file where it is, and
-    /// the name the device is told.
+    /// the name the device is told, and words as they are.
     #[test]
     fn a_sending_is_told_as_the_helper_reads_it() {
-        let files = [(PathBuf::from(r"C:\Users\me\trip\a.jpg"), "trip/a.jpg".to_string())];
-        assert_eq!(send_line(3, "AB12", &files).to_string(), r#"{"files":[{"name":"trip/a.jpg","path":"C:\\Users\\me\\trip\\a.jpg"}],"job":3,"kind":"send","to":"AB12"}"#);
+        let files = [Part::File(PathBuf::from(r"C:\Users\me\trip\a.jpg"), "trip/a.jpg".to_string()), Part::Words("周四开会".into(), "周四开会.txt".into())];
+        assert_eq!(send_line(3, "AB12", &files).to_string(), r#"{"files":[{"name":"trip/a.jpg","path":"C:\\Users\\me\\trip\\a.jpg"},{"name":"周四开会.txt","words":"周四开会"}],"job":3,"kind":"send","to":"AB12"}"#);
     }
 
     fn receipt(session: &str, files: &[&str]) -> Receipt {

@@ -21,6 +21,30 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const SCREENS_CHANGED: u32 = WM_APP + 6;
 /// What a window keeps for its pointer's shape where it shows none (no shape's resource number is so low).
 const NO_POINTER: isize = 1;
+const SIMO_INLINE_IME: PCWSTR = w!("Glance.SimoInlineIme");
+
+type SimoIme = (HWND, Option<String>, Option<String>);
+
+thread_local! {
+    static SIMO_IME: std::cell::RefCell<Vec<SimoIme>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn take_simo_ime() -> Vec<SimoIme> {
+    SIMO_IME.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
+fn simo_ime_flags(flags: LPARAM) -> LPARAM {
+    let composition = windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
+    LPARAM(flags.0 & !(composition as isize))
+}
+
+#[cfg(test)]
+#[test]
+fn simo_ime_keeps_native_candidates_but_not_the_native_composition_box() {
+    use windows::Win32::UI::Input::Ime::{ISC_SHOWUICANDIDATEWINDOW, ISC_SHOWUICOMPOSITIONWINDOW};
+    let flags = LPARAM((ISC_SHOWUICANDIDATEWINDOW | ISC_SHOWUICOMPOSITIONWINDOW) as isize);
+    assert_eq!(simo_ime_flags(flags).0, ISC_SHOWUICANDIDATEWINDOW as isize);
+}
 
 /// Posted to the window's thread when the mouse capture it held was taken
 /// from it (or let go).
@@ -92,7 +116,32 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lp
     if let Some(answered) = super::keys::answer(hwnd, message, wparam, lparam) {
         return answered;
     }
+    use windows::Win32::UI::WindowsAndMessaging::{GetPropW, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_NULL};
     match message {
+        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION | WM_IME_CHAR
+            if !unsafe { GetPropW(hwnd, SIMO_INLINE_IME) }.is_invalid() =>
+        {
+            if message != WM_IME_CHAR {
+                let (composition, result) = if message == WM_IME_COMPOSITION {
+                    super::simo::ime_strings(hwnd, lparam.0)
+                } else {
+                    (Some(String::new()), None)
+                };
+                SIMO_IME.with(|events| events.borrow_mut().push((hwnd, composition, result)));
+                // Wake the panel loop even when Windows sends the composition directly to this procedure.
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+            }
+            LRESULT(0)
+        }
+        WM_IME_SETCONTEXT if !unsafe { GetPropW(hwnd, SIMO_INLINE_IME) }.is_invalid() => {
+            // SIMO paints the composition itself. Leave the candidate-window flags intact.
+            let flags = simo_ime_flags(lparam);
+            unsafe { DefWindowProcW(hwnd, message, wparam, flags) }
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY => unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::RemovePropW(hwnd, SIMO_INLINE_IME);
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        },
         // Clicking the panel must leave the focus where it was; a window that comes to the front (a menu, the music
         // full screen) comes there as it is clicked, with the keyboard.
         WM_MOUSEACTIVATE => {
@@ -462,9 +511,20 @@ impl Window {
         }
     }
 
+    pub fn take_simo_keys(&self) {
+        use windows::Win32::Foundation::HANDLE;
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetPropW(self.hwnd, SIMO_INLINE_IME, Some(HANDLE(1 as *mut _)));
+        }
+        self.take_keys(true);
+    }
+
     /// Let take the focus or not (see `take_keys`), and standing so, but not brought to the front.
     fn let_take_keys(&self, on: bool) {
         unsafe {
+            if !on && windows::Win32::UI::WindowsAndMessaging::RemovePropW(self.hwnd, SIMO_INLINE_IME).is_ok() {
+                let_go_of_capture(self.hwnd);
+            }
             let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
             let style = if on { style & !WS_EX_NOACTIVATE.0 } else { style | WS_EX_NOACTIVATE.0 };
             SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, style as isize);

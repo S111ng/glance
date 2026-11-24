@@ -51,7 +51,7 @@ pub fn try_open(owner: HWND) -> Option<Opened> {
 pub fn put(owner: HWND, formats: &[(u32, Vec<u8>)]) -> bool {
     let Some(_opened) = open(owner) else { return false };
     unsafe {
-        let _ = EmptyClipboard();
+        if EmptyClipboard().is_err() { return false; }
         formats.iter().fold(true, |all, (format, bytes)| hand_over(*format, bytes) && all)
     }
 }

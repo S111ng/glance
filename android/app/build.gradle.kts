@@ -12,8 +12,8 @@ android {
         applicationId = "dev.weiyi.glance.remote"
         minSdk = 26
         targetSdk = 35
-        versionCode = 18
-        versionName = "0.4.3"
+        versionCode = 19
+        versionName = "0.4.6"
     }
 
     // The key the app is published under is its owner's alone: kept outside
@@ -63,4 +63,9 @@ dependencies {
     // The pairing code's QR, read without Google's services (phones sold
     // in mainland China have none).
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    // What can be tried on a PC's JVM (the protocol, the pairing link, where what comes is kept): org.json as it is,
+    // where the Android library has only its outline.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

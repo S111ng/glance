@@ -66,6 +66,7 @@ pub(super) fn part_name(part: Part, lang: Lang) -> &'static str {
         Part::Monitor => pick(lang, "监控", "Monitor"),
         Part::Workbench => pick(lang, "工作台", "Workbench"),
         Part::Music => pick(lang, "音乐", "Music"),
+        Part::Simo => "SIMO",
     }
 }
 
@@ -75,6 +76,7 @@ fn part_word(part: Part, lang: Lang) -> &'static str {
         Part::Monitor => pick(lang, "实时硬件数据", "Live readings"),
         Part::Workbench => pick(lang, "时间与工具", "Time and tools"),
         Part::Music => pick(lang, "歌曲与歌词", "Songs and lyrics"),
+        Part::Simo => pick(lang, "GPT 对话", "GPT chat"),
     }
 }
 
@@ -83,6 +85,7 @@ pub(super) fn part_icon(part: Part) -> Icon {
         Part::Monitor => Icon::Gauge,
         Part::Workbench => Icon::PencilRuler,
         Part::Music => Icon::Music,
+        Part::Simo => Icon::MessageCircle,
     }
 }
 
@@ -165,6 +168,7 @@ impl Ui {
                     };
                     frame.origin(0.0, 0.0);
                 }
+                Part::Simo => self.simo_picture(frame, inside),
             }
             unsafe { frame.dc.PopAxisAlignedClip() };
             let below = picture.y + picture.h + 8.0;
@@ -215,6 +219,17 @@ impl Ui {
         if let Err(error) = drew {
             frame.fail(error);
         }
+    }
+
+    fn simo_picture(&mut self, frame: &Frame, area: Rect) {
+        let k = (area.w / crate::ui::simo::WIDTH).min(area.h / crate::ui::simo::HEIGHT).min(1.0);
+        let local = Matrix3x2::scale(k, k) * Matrix3x2::translation(area.x + (area.w - crate::ui::simo::WIDTH * k) / 2.0, area.y + (area.h - crate::ui::simo::HEIGHT * k) / 2.0);
+        let middle = self.stage.middle();
+        let (theme, _) = self.stage.look(Skin::named(&self.settings.skin), self.prefs.theme, middle);
+        frame.place(local);
+        let mut chat = crate::simo::Chat::default();
+        crate::ui::simo::paint(frame, &theme, &mut chat, (crate::ui::simo::WIDTH, crate::ui::simo::HEIGHT), Instant::now());
+        frame.origin(0.0, 0.0);
     }
 
     /// The screen shown large in the editor, by its name: the one chosen, while it is there; every screen small, else

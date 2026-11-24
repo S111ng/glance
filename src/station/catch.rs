@@ -73,13 +73,11 @@ fn wanted() -> Vec<Wanted> {
         let settings = crate::app().settings.lock().unwrap();
         (settings.places().clone(), crate::ui::prefs::module_on_in(&settings.view, "workbench", "station"))
     };
-    if !station {
-        return wanted;
-    }
     for monitor in crate::screens::monitors() {
         let Some(id) = crate::screens::id_of(monitor) else { continue };
         for edge in [Edge::Left, Edge::Right, Edge::Top] {
-            if places.part(&id, edge) != Some(Part::Workbench) {
+            let Some(part) = places.part(&id, edge) else { continue };
+            if part != Part::Simo && (part != Part::Workbench || !station) {
                 continue;
             }
             let strip = match edge {
@@ -87,7 +85,8 @@ fn wanted() -> Vec<Wanted> {
                 Edge::Right => RECT { left: monitor.right - STRIP, ..monitor },
                 Edge::Top => RECT { bottom: monitor.top + STRIP, ..monitor },
             };
-            wanted.push((strip, vec![strip], Some(edge), Lands::Station, None));
+            let lands = if part == Part::Simo { Lands::Simo(edge) } else { Lands::Station };
+            wanted.push((strip, vec![strip], Some(edge), lands, None));
         }
     }
     wanted
@@ -190,7 +189,12 @@ impl Catchers {
     /// Up where drops are wanted while something is dragged (by another program, or off the station: see
     /// `drag::under_way`); none else. What each sees goes to `run::caught`, or (a device nearby's) is sent there.
     pub fn follow(&mut self) {
-        let wanted = if dragging() || super::drag::under_way() { wanted() } else { Vec::new() };
+        let dragged = dragging() || super::drag::under_way();
+        // (No drag at all: none from another program over a station either, see `send::foreign`.)
+        if !dragged {
+            super::send::foreign(false);
+        }
+        let wanted = if dragged { wanted() } else { Vec::new() };
         let same = wanted.len() == self.up.len() && wanted.iter().zip(&self.up).all(|((rect, parts, edge, lands, over), up)| *rect == up.rect && *parts == up.parts && *edge == up.edge && *lands == up.lands && *over == up.over);
         if same {
             return;
@@ -245,11 +249,23 @@ fn make(rect: RECT, parts: Vec<RECT>, edge: Option<Edge>, lands: Lands, over: Op
         }
         let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(window, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-        let told = move |dragged: Dragged| super::run::caught(dragged, edge, lands, over);
+        let last_point = std::cell::Cell::new(windows::Win32::Foundation::POINT::default());
+        let told = move |dragged: Dragged| match dragged {
+            Dragged::Over(at) => {
+                last_point.set(at);
+                super::run::caught(Dragged::Over(at), edge, lands, over);
+            }
+            dropped if matches!(lands, Lands::Simo(_)) => {
+                if let Lands::Simo(edge) = lands {
+                    super::run::caught_simo(last_point.get(), edge, dropped);
+                }
+            }
+            other => super::run::caught(other, edge, lands, over),
+        };
         // (What is kept at hand may be given a file off the station; the station, none of its own again; a page other
         // than the station's, nothing, only told it comes; a device nearby, what is dragged off the station, sent.)
         let target = match lands {
-            Lands::Apps => Target::new(told),
+            Lands::Apps | Lands::Send => Target::new(told),
             Lands::Pages(page) if page != crate::ui::view::Tab::Shelf => Target::refusing(told),
             Lands::Device(key) => super::send::ToDevice::over(key, rect),
             _ => Target::not_own(told),

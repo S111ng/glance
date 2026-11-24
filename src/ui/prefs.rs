@@ -455,7 +455,7 @@ impl Prefs {
         use crate::settings::Part;
         match part {
             Part::Workbench => self.modules = std::mem::take(&mut self.workbench),
-            Part::Monitor | Part::Music => self.modules.retain(|module| module.id != "lyrics"),
+            Part::Monitor | Part::Music | Part::Simo => self.modules.retain(|module| module.id != "lyrics"),
         }
         self
     }

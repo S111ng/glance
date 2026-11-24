@@ -238,6 +238,8 @@ pub enum Hit {
     /// What is kept at hand, by its place (see `station::apps`); the place to add more; where something dragged may
     /// be dropped to be kept at hand.
     App(u64),
+    /// A currently open top-level window, by its HWND.
+    RunningWindow(isize),
     /// While one kept at hand is held and dragged: the place among them the pointer is at (where it would go; these
     /// stand still as the others move to make room, so that what the pointer is over is not moved from under it).
     AppSlot(u16),
@@ -1117,6 +1119,7 @@ pub fn named(hits: &[HitBox], hit: Hit, lang: Lang) -> Option<String> {
         Hit::Recent(crate::station::recent::Entry::File(key)) => crate::station::recent::shown().iter().find(|came| came.key == key).map(|came| Lately::of(came, lang, 0).label),
         Hit::Recent(entry @ crate::station::recent::Entry::Burst(filter, _)) => Lately::rows(&crate::station::recent::shown(), filter, lang, 0).into_iter().find(|row| row.entry == entry).map(|row| row.label),
         Hit::App(number) => crate::station::apps::numbered(number).map(|app| app.name),
+        Hit::RunningWindow(handle) => crate::station::windows::title(handle),
         _ => None,
     }
 }
@@ -1244,6 +1247,11 @@ impl Tile {
                     (1, true) => lang.pick("文件已不存在", "File no longer exists").to_string(),
                     (n, false) => format!("{n} {}", lang.pick("个文件", "files")),
                     (n, true) => format!("{n} {}", lang.pick("个文件已不存在", "files no longer exist")),
+                };
+                // (Sent from a device nearby to the folder chosen for them: from whom said with it.)
+                let kind = match &item.from {
+                    Some(device) => format!("{kind} · {} {}", lang.pick("来自", "from"), device.alias),
+                    None => kind,
                 };
                 (name, kind, Face::Picture { path: first, more: paths.len().saturating_sub(1) })
             }
@@ -2079,6 +2087,7 @@ fn app_spot(scene: &Scene, target: &str, at: usize, cell: &dyn Fn(usize) -> (f32
 fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: RailSide, hits: &mut Vec<HitBox>) {
     let theme = scene.theme;
     let (apps, over): (&[(String, String)], bool) = lane.blocks.iter().find_map(|block| if let Block::Apps { apps, over, .. } = block { Some((apps.as_slice(), *over)) } else { None }).unwrap_or((&[], false));
+    let running = if crate::app().settings.lock().unwrap().station.running_windows { crate::station::windows::shown() } else { Vec::new() };
     let across = side == RailSide::Bottom;
     let foot = RAIL_FOOT;
     // (Along the rail: down it, or across it under the columns.)
@@ -2089,7 +2098,7 @@ fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: 
     };
     let lit_on = |hit: Hit| scene.hover == Some(hit);
     // Its things, and the place to add more after them, scrolled along by the wheel where they are more than fit.
-    let whole = (apps.len() + 1) as f32 * RAIL_CELL;
+    let whole = (running.len() + apps.len() + 1) as f32 * RAIL_CELL;
     let most = (whole - length).max(0.0);
     let scroll = scene.scrolls.at(List::Apps).clamp(0.0, most);
     let (view_x, view_y, view_w, view_h) = if across { (start, area.y, length, area.h) } else { (area.x, start, area.w, length) };
@@ -2103,26 +2112,38 @@ fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: 
     let inset = (RAIL_CELL - RAIL_SIDE) / 2.0;
     // (The one held: along the rail as the pointer has it, in its middle across it.)
     let held_cell = |(px, py): (f32, f32)| if across { (px - RAIL_CELL / 2.0, area.y + (area.h - RAIL_CELL) / 2.0) } else { (area.x + (area.w - RAIL_CELL) / 2.0, py - RAIL_CELL / 2.0) };
-    for at in 0..=apps.len() {
-        // Each in its place, or on its way to it; the one held drawn after all, where the pointer has it.
-        let spot = match apps.get(at) {
-            Some((_, target)) => app_spot(scene, target, at, &shown_cell, &held_cell),
-            None => Some(shown_cell(at)),
-        };
-        let Some((x, y)) = spot else { continue };
-        if if across { x + RAIL_CELL < view_x || x > view_x + view_w } else { y + RAIL_CELL < view_y || y > view_y + view_h } {
-            continue;
+    let in_view = |x: f32, y: f32| if across { x + RAIL_CELL >= view_x && x <= view_x + view_w } else { y + RAIL_CELL >= view_y && y <= view_y + view_h };
+    crate::station::windows::keep_icons(&running);
+    for (at, window) in running.iter().enumerate() {
+        let (x, y) = shown_cell(at);
+        if !in_view(x, y) { continue; }
+        let hit = Hit::RunningWindow(window.handle);
+        if lit_on(hit) {
+            app_plate(frame, theme, (x + 2.0, y + 2.0, RAIL_CELL - 4.0), (RAIL_CELL - 4.0 - RAIL_SIDE) / 2.0);
         }
-        let Some((name, target)) = apps.get(at) else {
-            paint_adder(frame, scene, x + inset, y + inset, RAIL_SIDE, over, &mut placed);
-            continue;
-        };
+        if let Some(icon) = crate::station::windows::icon(window, (RAIL_SIDE * frame.pixels_per_dip()).ceil().clamp(32.0, 256.0) as u32) {
+            let (left, top, width, height) = icon.fitted_in(x + inset, y + inset, RAIL_SIDE, RAIL_SIDE);
+            frame.picture(&icon, left, top, width, height, 0.0, 1.0);
+        } else {
+            frame.icon(Icon::AppWindow, Point { x: x + RAIL_CELL / 2.0, y: y + RAIL_CELL / 2.0 }, RAIL_SIDE * 0.68, theme.text2);
+        }
+        placed.push((x, y, RAIL_CELL, RAIL_CELL, hit));
+        placed.push((x, y, RAIL_CELL, RAIL_CELL, Hit::Shortened));
+    }
+    let app_cell = |at: usize| shown_cell(running.len() + at);
+    for (at, (name, target)) in apps.iter().enumerate() {
+        let Some((x, y)) = app_spot(scene, target, at, &app_cell, &held_cell) else { continue };
+        if !in_view(x, y) { continue; }
         let hit = Hit::App(crate::station::apps::number_of(target));
         if lit_on(hit) {
             app_plate(frame, theme, (x + 2.0, y + 2.0, RAIL_CELL - 4.0), (RAIL_CELL - 4.0 - RAIL_SIDE) / 2.0);
         }
         paint_app(frame, theme, name, target, x + inset, y + inset, RAIL_SIDE);
         placed.push((x, y, RAIL_CELL, RAIL_CELL, hit));
+    }
+    let (x, y) = shown_cell(running.len() + apps.len());
+    if in_view(x, y) {
+        paint_adder(frame, scene, x + inset, y + inset, RAIL_SIDE, over, &mut placed);
     }
     // The one held, lifted where the pointer has it along the rail; the places it may go to, standing still, all of
     // the rail between them (before the first, past the last).
@@ -2139,8 +2160,8 @@ fn paint_rail(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, side: 
     // The places one dragged among them may go to, standing still (see `Hit::AppSlot`), all of the rail between them
     // (before the first, past the last, the "+" over it): after all else.
     let places: Vec<HitBox> = (0..apps.len()).map(|at| {
-        let (x, y) = shown_cell(at);
-        let (lead, tail) = (if at == 0 { 1000.0 } else { 0.0 }, if at + 1 == apps.len() { 1000.0 } else { 0.0 });
+        let (x, y) = shown_cell(running.len() + at);
+        let (lead, tail) = (if at == 0 { running.len() as f32 * RAIL_CELL } else { 0.0 }, if at + 1 == apps.len() { 1000.0 } else { 0.0 });
         if across { (x - lead, area.y, RAIL_CELL + lead + tail, area.h, Hit::AppSlot(at as u16)) } else { (area.x, y - lead, area.w, RAIL_CELL + lead + tail, Hit::AppSlot(at as u16)) }
     }).collect();
     // (Only what shows of them is pressed.)
@@ -2392,17 +2413,18 @@ impl Hash for Block {
                 (apps, rows, named, over).hash(state);
                 crate::station::thumbs::changes().hash(state);
             }
+            // (A station's pages: the devices nearby drawn at their foot as something is dragged too, see `paint_strip`.)
             Block::Recent { rows, filter, view, tall, nowhere } => {
                 (rows, filter, view, tall.to_bits(), nowhere).hash(state);
-                crate::station::thumbs::changes().hash(state);
+                (crate::station::thumbs::changes(), crate::station::send::changes()).hash(state);
             }
             Block::Shelf { tiles, shows, tall, said, over } => {
                 (tiles, shows, tall.to_bits(), said, over).hash(state);
-                crate::station::thumbs::changes().hash(state);
+                (crate::station::thumbs::changes(), crate::station::send::changes()).hash(state);
             }
             Block::Copies { rows, filter, view, tall } => {
                 (rows, filter, view, tall.to_bits()).hash(state);
-                crate::station::thumbs::changes().hash(state);
+                (crate::station::thumbs::changes(), crate::station::send::changes()).hash(state);
             }
         }
     }
@@ -4201,35 +4223,53 @@ fn paint_lane(frame: &dyn Canvas, scene: &Scene, lane: &Lane, area: Rect, grow: 
     }
 }
 
-/// Its room round the devices, the line naming what it is, and each device's (DIPs: see `paint_strip`).
+/// Its room round the devices, the line naming what it is, and each device's (DIPs: see `paint_strip`): how narrow
+/// its box may be, how round, the room inside its edge (as round as it is, all round), its mark's radius, and the
+/// room under its mark and between its name and what it is.
 const STRIP_INSET: f32 = 10.0;
 const STRIP_PAD: (f32, f32) = (10.0, 8.0);
 const STRIP_SAYS: f32 = 14.0;
 const STRIP_SAYS_GAP: f32 = 6.0;
 const STRIP_GAP: f32 = 6.0;
-const CHIP_TALL: f32 = 66.0;
 const CHIP_LEAST: f32 = 72.0;
+const CHIP_ROUND: f32 = 10.0;
+const CHIP_INSET: f32 = CHIP_ROUND;
 const CHIP_MARK: f32 = 16.0;
+const CHIP_MARK_GAP: f32 = 6.0;
+const CHIP_LINE_GAP: f32 = 3.0;
 /// How far below its place it rises from.
 const STRIP_RISES: f32 = 24.0;
 
 /// A box: where it starts, how wide, how tall (DIPs).
 type Boxed = (f32, f32, f32, f32);
 
-/// Where the strip and its devices are in a lane's `area` (DIPs), with `count` devices: the strip, and each device's
-/// box (as many across as fit, three at most; one row with none, where it says it looks for them).
-fn strip_places(area: Rect, count: usize) -> (Boxed, Vec<Boxed>) {
+/// A device's name on the strip in `theme`, and what it is under that.
+fn chip_fonts(theme: &Theme) -> (Font, Font) {
+    (Font { weight: 600.0, size: theme.small.size * 0.92, ..theme.small }, Font { size: theme.small.size * 0.88, ..theme.small })
+}
+
+/// How tall a device's box on the strip is in `theme`: its mark, its name and what it is under that, the room inside
+/// its edge above and below.
+fn chip_tall(theme: &Theme) -> f32 {
+    let (name, kind) = chip_fonts(theme);
+    2.0 * CHIP_INSET + 2.0 * CHIP_MARK + CHIP_MARK_GAP + name.size + CHIP_LINE_GAP + kind.size
+}
+
+/// Where the strip and its devices are in a lane's `area` (DIPs), with `count` devices each `chip_tall` tall: the
+/// strip, and each device's box (as many across as fit, three at most; one row with none, where it says it looks for
+/// them).
+fn strip_places(area: Rect, count: usize, chip_tall: f32) -> (Boxed, Vec<Boxed>) {
     let (x, w) = (area.x + STRIP_INSET, area.w - 2.0 * STRIP_INSET);
     let inner = w - 2.0 * STRIP_PAD.0;
     let across = (((inner + STRIP_GAP) / (CHIP_LEAST + STRIP_GAP)).floor() as usize).clamp(1, 3);
     let rows = count.div_ceil(across).max(1);
-    let tall = (2.0 * STRIP_PAD.1 + STRIP_SAYS + STRIP_SAYS_GAP + rows as f32 * CHIP_TALL + (rows - 1) as f32 * STRIP_GAP).min(area.h - 2.0 * STRIP_INSET);
+    let tall = (2.0 * STRIP_PAD.1 + STRIP_SAYS + STRIP_SAYS_GAP + rows as f32 * chip_tall + (rows - 1) as f32 * STRIP_GAP).min(area.h - 2.0 * STRIP_INSET);
     let y = area.y + area.h - STRIP_INSET - tall;
     let wide = (inner - (across - 1) as f32 * STRIP_GAP) / across as f32;
     let chips = (0..count)
         .map(|at| {
             let (column, row) = ((at % across) as f32, (at / across) as f32);
-            (x + STRIP_PAD.0 + column * (wide + STRIP_GAP), y + STRIP_PAD.1 + STRIP_SAYS + STRIP_SAYS_GAP + row * (CHIP_TALL + STRIP_GAP), wide, CHIP_TALL)
+            (x + STRIP_PAD.0 + column * (wide + STRIP_GAP), y + STRIP_PAD.1 + STRIP_SAYS + STRIP_SAYS_GAP + row * (chip_tall + STRIP_GAP), wide, chip_tall)
         })
         .collect();
     ((x, y, w, tall), chips)
@@ -4272,7 +4312,7 @@ fn sending_said(sending: &crate::nearby::Sending, lang: Lang) -> String {
 /// cancelled, then the strip, over what is under it.
 fn paint_strip(frame: &dyn Canvas, scene: &Scene, ink: super::theme::Ink, area: Rect, strip: &crate::station::send::Shown) -> Vec<HitBox> {
     let (theme, lang) = (scene.theme, scene.lang);
-    let ((x, y, w, h), chips) = strip_places(area, strip.chips.len());
+    let ((x, y, w, h), chips) = strip_places(area, strip.chips.len(), chip_tall(theme));
     let up = strip.up.clamp(0.0, 1.0);
     if up <= 0.0 {
         return Vec::new();
@@ -4285,21 +4325,22 @@ fn paint_strip(frame: &dyn Canvas, scene: &Scene, ink: super::theme::Ink, area: 
     let says = Font { weight: 600.0, ..theme.small };
     frame.text(lang.pick("发送到", "Send to"), says, seen(theme.text2, 1.0), x + STRIP_PAD.0, frame.line_in(says, y + drop + STRIP_PAD.1, STRIP_SAYS), w - 2.0 * STRIP_PAD.0, Align::Start);
     let dim = if strip.stays_here { 0.4 } else { 1.0 };
-    let name_font = Font { weight: 600.0, size: theme.small.size * 0.92, ..theme.small };
-    let kind_font = Font { size: theme.small.size * 0.88, ..theme.small };
+    let (name_font, kind_font) = chip_fonts(theme);
     if strip.chips.is_empty() {
-        let middle = y + drop + STRIP_PAD.1 + STRIP_SAYS + STRIP_SAYS_GAP + CHIP_TALL / 2.0;
+        let middle = y + drop + STRIP_PAD.1 + STRIP_SAYS + STRIP_SAYS_GAP + chip_tall(theme) / 2.0;
         centred(frame, lang.pick("正在查找附近的设备", "Looking for devices nearby"), theme.small, seen(theme.text3, 1.0), x, frame.line_top(theme.small, middle), w);
     }
     for (chip, &(cx, cy, cw, ch)) in strip.chips.iter().zip(&chips) {
         let cy = cy + drop;
         let cancelling = cancels(chip) && scene.hover == Some(Hit::SendTo(chip.key));
         if chip.lit {
-            frame.fill_rounded(seen(ink.trace, 0.22), cx, cy, cw, ch, 10.0);
+            frame.fill_rounded(seen(ink.trace, 0.22), cx, cy, cw, ch, CHIP_ROUND);
         } else if cancelling {
-            frame.fill_rounded(seen(plate.highlight, 1.0), cx, cy, cw, ch, 10.0);
+            frame.fill_rounded(seen(plate.highlight, 1.0), cx, cy, cw, ch, CHIP_ROUND);
         }
-        let centre = Point { x: cx + cw / 2.0, y: cy + 4.0 + CHIP_MARK };
+        // (Each in from its box's edge by the room inside it, all round.)
+        let (inner_x, inner_w) = (cx + CHIP_INSET, cw - 2.0 * CHIP_INSET);
+        let centre = Point { x: cx + cw / 2.0, y: cy + CHIP_INSET + CHIP_MARK };
         let scale = 1.0 + crate::station::send::GROWN * chip.grown;
         let sent = chip.sending.as_ref().filter(|(sending, _)| *sending == crate::nearby::Sending::Sent);
         match sent {
@@ -4321,9 +4362,9 @@ fn paint_strip(frame: &dyn Canvas, scene: &Scene, ink: super::theme::Ink, area: 
             frame.arc(centre, CHIP_MARK + 1.5, 0.0, std::f32::consts::TAU, seen(theme.text3, 0.25 * dim), 2.5);
             frame.arc(centre, CHIP_MARK + 1.5, 0.0, std::f32::consts::TAU * gone, seen(ink.trace, dim), 2.5);
         }
-        let name_top = cy + 4.0 + 2.0 * CHIP_MARK + 4.0;
-        let name = fitted(frame, &chip.alias, name_font, cw - 4.0);
-        centred(frame, &name, name_font, seen(theme.text, dim), cx, name_top, cw);
+        let name_middle = cy + CHIP_INSET + 2.0 * CHIP_MARK + CHIP_MARK_GAP + name_font.size / 2.0;
+        let name = fitted(frame, &chip.alias, name_font, inner_w);
+        centred(frame, &name, name_font, seen(theme.text, dim), inner_x, frame.line_top(name_font, name_middle), inner_w);
         let said = match &chip.sending {
             _ if cancelling => lang.pick("取消发送", "Cancel").to_string(),
             Some((sending, _)) => sending_said(sending, lang),
@@ -4331,8 +4372,9 @@ fn paint_strip(frame: &dyn Canvas, scene: &Scene, ink: super::theme::Ink, area: 
         };
         // (Asked for what only the user can give: said as what wants them.)
         let asks = !cancelling && matches!(chip.sending, Some((crate::nearby::Sending::Pin { .. }, _)));
-        let said = fitted(frame, &said, kind_font, cw - 4.0);
-        centred(frame, &said, kind_font, seen(if asks { theme.signal } else { theme.text2 }, 0.85 * dim), cx, name_top + name_font.size + 4.0, cw);
+        let said = fitted(frame, &said, kind_font, inner_w);
+        let said_middle = name_middle + name_font.size / 2.0 + CHIP_LINE_GAP + kind_font.size / 2.0;
+        centred(frame, &said, kind_font, seen(if asks { theme.signal } else { theme.text2 }, 0.85 * dim), inner_x, frame.line_top(kind_font, said_middle), inner_w);
     }
     // (Its places where it stands, risen: the boxes stay put as it rises, the windows catching drops over them with
     // them.)
@@ -6989,6 +7031,37 @@ otepad.exe", "Notepad"),
         let pixels = draw();
         crate::station::send::pretend(None);
         crate::studio::save_png(&std::path::PathBuf::from(format!("{}/target/send-strip.png", env!("CARGO_MANIFEST_DIR"))), (w * 2.0) as u32, (h * 2.0) as u32, &pixels).unwrap();
+    }
+
+    /// A station's page, whose drawing is kept while what it shows is the same (see `render::PanelLayers::draw_on`), is
+    /// told to be drawn again as the devices nearby at its foot change: a device lit, then not, and the strip gone. Not
+    /// told, a device stayed lit on the screen up to a second after the pointer left it.
+    #[test]
+    fn a_station_is_drawn_again_as_its_strip_changes() {
+        use crate::station::send::{pretend, ChipShown, Shown};
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let _pretending = crate::pretending();
+        let pages = [
+            Block::Shelf { tiles: Vec::new(), shows: Shows::Row, tall: 100.0, said: None, over: false },
+            Block::Copies { rows: Vec::new(), filter: Default::default(), view: ShelfView::Cards, tall: 100.0 },
+            Block::Recent { rows: Vec::new(), filter: Default::default(), view: ShelfView::Cards, tall: 100.0, nowhere: false },
+        ];
+        let hashed = |block: &Block| {
+            let mut hasher = DefaultHasher::new();
+            block.hash(&mut hasher);
+            hasher.finish()
+        };
+        let strip = |lit: bool| Shown { up: 1.0, open: true, stays_here: false, chips: vec![ChipShown { key: 1, alias: "Galaxy Z Fold6".into(), kind: Some("mobile".into()), grown: 1.0, lit, sending: None }] };
+        for page in &pages {
+            pretend(Some(strip(true)));
+            let lit = hashed(page);
+            assert_eq!(hashed(page), lit, "drawn again with nothing changed");
+            pretend(Some(strip(false)));
+            let left = hashed(page);
+            assert_ne!(left, lit, "a device let go of by the pointer still drawn lit");
+            pretend(None);
+            assert_ne!(hashed(page), left, "the strip gone still drawn");
+        }
     }
 
     /// Things chosen together on the station's lane in each skin, light and dark (a row each): on the station as cards

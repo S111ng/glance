@@ -1,6 +1,6 @@
 [package]
 name = "glance-remote"
-version = "0.4.5-preview"
+version = "0.4.6-preview"
 license = "MIT"
 edition = "2021"
 description = "Glance's remote control helper: what a paired phone may ask of this PC. Runs as the user, never elevated."
@@ -69,3 +69,10 @@ features = [
 opt-level = "s"
 lto = true
 strip = true
+
+# Built quickly to try a change on this PC (`cargo build --profile fast`, into target/fast), as the app is.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
